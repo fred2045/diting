@@ -1,0 +1,38 @@
+# 环境变量（含密码与各平台登录 cookie）
+.env
+
+# 本地备份（不入库）
+backup/
+*.sql
+
+# 日志 / 运行产物
+# ★ 只忽略**运行产物**目录：原来的 `logs/` 不带锚点，把 `reader/apps/logs/`
+#   和 `reader/templates/logs/` 也一起忽略了 —— 整个日志页从没进过版本库（2026-11-02 发现）。
+/data/logs/
+*.log
+
+# macOS / 编辑器
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 本地数据（运行时产物，全部不入库）
+data/
+feeds/
+reader/data/
+
+# 读者画像是个人数据，不入库；入库模板见 Meta/interest-profile.example.md
+Meta/interest-profile.md
+# 本体是「AI 建议 + 人审批」出来的个人知识骨架（含你的真实分类与关注对象），不入库
+Meta/ontology.md
+# 设置页保存全局层文件前留下的旧版备份（救急用，是个人数据的副本）
+Meta/.history/
+
+# 页面截图：README 的界面图与二维码放 docs/img/，必须入库（否则 README 只剩占位）。
+# 临时核对用的原始截图不要放这里，放 /tmp 或其他被忽略的位置。

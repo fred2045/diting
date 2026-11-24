@@ -1,0 +1,218 @@
+services:
+  # ------------------------------------------------------------------
+  # Miniflux —— 采集 / 阅读 / 全文快照 / REST API
+  # ------------------------------------------------------------------
+  miniflux:
+    image: miniflux/miniflux:latest
+    container_name: diting-miniflux
+    restart: unless-stopped
+    ports:
+      - '8080:8080'
+    depends_on:
+      db:
+        condition: service_healthy
+      rsshub:
+        # ★ 用 service_started 而非 service_healthy：
+        # Miniflux 启动并不依赖 RSSHub 就绪；RSSHub 挂了不该拖住 Miniflux
+        condition: service_started
+    environment:
+      # --- 数据库（Miniflux 只支持 PostgreSQL，不支持 SQLite）---
+      - DATABASE_URL=postgres://${POSTGRES_USER:-diting}:${POSTGRES_PASSWORD:-diting}@db:5432/${POSTGRES_DB:-diting}?sslmode=disable
+      - RUN_MIGRATIONS=1
+
+      # --- 管理员（首次启动自动创建）---
+      - CREATE_ADMIN=1
+      - ADMIN_USERNAME=${MINIFLUX_ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${MINIFLUX_ADMIN_PASSWORD:-changeme}
+      - BASE_URL=http://localhost:8080/
+
+      # --- ★ 双轨轮询：全局慢速车道 + 快速车道（fast_refresh，由 reader 进程内调度）---
+      # 闸门模型（源码 internal/cli/scheduler.go + storage/batch.go）：
+      #   每 POLLING_FREQUENCY 开一次闸 → SQL 选「已到期」的 feed（BATCH_SIZE=100，够装全库）
+      #   → 按 host 计数过滤（POLLING_LIMIT_PER_HOST）
+      #   → 交给 WORKER_POOL_SIZE 个 worker 抓
+      #   → 抓完写 next_check_at =「完成时刻」+ interval，interval = max(MIN_INTERVAL, feed ttl)
+      #
+      # ★ 相位亏（必须懂，否则白亏一倍）：
+      #   若 MIN_INTERVAL 恰好 == POLLING_FREQUENCY，完成时刻 = 开闸 + 抓取耗时，
+      #   再加 60 分钟 → 必然落在「下一次开闸之后几秒」被挡在门外 → 再等一整轮。
+      #   实际间隔 = ceil((interval + 抓取耗时) / POLLING_FREQUENCY) × POLLING_FREQUENCY
+      #   所以 MIN_INTERVAL 必须比 POLLING_FREQUENCY 小一段（≥ 抓取耗时）：
+      #   现值 55 vs 60 → 留 5 分钟余量（实测抓取 5~60 秒）→ 实际间隔 ≈ 60 分钟 ✓
+      #   ⚠ 两个变量必须一起改；千万不要设成相等。
+      - POLLING_FREQUENCY=60
+      - SCHEDULER_ROUND_ROBIN_MIN_INTERVAL=55
+
+      # 手动/API refresh 的最小间隔（建议值；实测 API `PUT /v1/feeds/{id}/refresh` 不受此限，
+      # 只有网页 UI 的「刷新全部」按钮会撞它）
+      - FORCE_REFRESH_INTERVAL=5
+
+      # RSSHub 雪球路由要过 Playwright，比普通路由慢，超时放宽
+      - HTTP_CLIENT_TIMEOUT=60
+
+      # worker 池 = 真实出网并发上限（同时最多 8 个请求，也是打到 RSSHub 的并发上限）
+      - WORKER_POOL_SIZE=8
+
+      # ★ 每轮最多放行「同一个 host」几个 feed（按 feed_url 的 host 计数，含端口）。
+      # 若多数源都指向同一个 RSSHub，设小了就会排队：每个 host 每轮只放 N 个，
+      # 轮完一圈要 (该 host 的源数 ÷ N) × 轮询周期，积压会直接表现成「源逾期」。
+      # 设 20（≥ 任一 host 下的最大源数）→ 一轮全部放行，「排队型积压」直接消失。
+      # 真实并发由 WORKER_POOL_SIZE=8 兜底，不会把 RSSHub 打死。
+      # 0 = 不限制（这是代码默认值，本项目曾显式设小过，造成人为瓶颈）。
+      - POLLING_LIMIT_PER_HOST=20
+
+      # ★ 连续失败几次后把该源踢出调度（源码 storage/batch.go: `parsing_error_count < N`）。
+      # 默认 3：三次网络抖动就让源「永久不再调度」，而 UI 上只表现为"积压"，
+      # 现有三层监控都不告警 —— 延迟直接变成丢失。
+      # 设 0 = batch 查询根本不加该条件 → 永不踢出；"这源该不该废弃"交给人来判断
+      # （scripts/feed_health.py 的调度异常段会 WARN，并随每日汇总一并报出）。
+      - POLLING_PARSING_ERROR_LIMIT=0
+
+      # ★ 必须开：Miniflux 2.3.x 默认开启 SSRF 防护，会拒绝访问私有网段。
+      # compose 内网里 rsshub 解析成 172.18.x.x，正落在 172.16.0.0/12，
+      # 不开这个就报 "refusing to access private network host"。
+      # 代价：Miniflux 从此可以访问任意内网地址（含 169.254.169.254 元数据），
+      # 只适用于"源全部可信"的自用场景。
+      - FETCHER_ALLOW_PRIVATE_NETWORKS=1
+      # 同理，将来若把 webhook / Ntfy / Apprise 指向本机服务，需要这个
+      - INTEGRATION_ALLOW_PRIVATE_NETWORKS=1
+
+      # 已读条目 60 天后归档（不是删除，仍可检索）。0 = 不归档
+      - CLEANUP_ARCHIVE_READ_DAYS=60
+    healthcheck:
+      test: ['CMD', '/usr/bin/miniflux', '-healthcheck', 'auto']
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - diting
+
+  # ------------------------------------------------------------------
+  # PostgreSQL —— Miniflux 唯一支持的后端
+  # ------------------------------------------------------------------
+  db:
+    image: postgres:17-alpine
+    container_name: diting-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-diting}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-diting}
+      - POSTGRES_DB=${POSTGRES_DB:-diting}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-diting} -d ${POSTGRES_DB:-diting}']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - diting
+
+  # ------------------------------------------------------------------
+  # RSSHub —— 网页转 RSS
+  # 必须用 chromium-bundled：雪球 user 路由靠 Playwright 取 token
+  # （标准镜像约 500MB，跑不了 /xueqiu/user；本镜像约 1.5GB）
+  # ------------------------------------------------------------------
+  rsshub:
+    image: diygod/rsshub:chromium-bundled
+    container_name: diting-rsshub
+    restart: unless-stopped
+    ports:
+      - '1200:1200'
+    environment:
+      - NODE_ENV=production
+      - LOGGER_LEVEL=info
+
+      # --- 缓存 ---
+      # 本地单实例用内存缓存即可；迁 VPS 24/7 时再改 redis
+      - CACHE_TYPE=memory
+      # routeExpire：路由结果 + 雪球 token 的缓存时长，默认 300 秒
+      # 这也是 feed 里 <ttl> 的来源：ttl = CACHE_EXPIRE / 60
+      # 保持 300 → ttl=5 分钟，不会把 Miniflux 的 10 分钟轮询顶上去
+      - CACHE_EXPIRE=300
+      - CACHE_CONTENT_EXPIRE=3600
+
+      # 雪球路由要先开无头浏览器再打 API，超时放宽到 60 秒
+      - REQUEST_TIMEOUT=60000
+
+      # --- 按需开启 ---
+      # 若某个源需要特定网络出口才能访问，请由使用者自行配置；
+      # 本项目不附带、也不推荐任何特定的出口方案。
+      #
+      # 雪球只有 /xueqiu/user_stock/:id 和 /xueqiu/timeline/ 需要 cookie，
+      # /xueqiu/user 不需要，别白配：
+      # - XUEQIU_COOKIES=<用你自己的账号取得的登录 cookie>
+      #
+      # ★ 知乎所有路由都需登录 cookie（反爬 403）：容器不配时 RSSHub 会尝试
+      #   用 JSDOM 自动领游客 __zse_ck，但本地环境稳定失败。值来自 .env 的
+      #   ZHIHU_COOKIES（已 gitignore）；cookie 含 d_c0 + __zse_ck，有时效。
+      - ZHIHU_COOKIES=${ZHIHU_COOKIES}
+      #
+      # ★ X / Twitter：/twitter/user/:id 必须有登录态，否则 RSSHub 直接抛
+      #   "ConfigNotFoundError: Twitter API is not configured"。
+      #   只要 cookie 里的 **auth_token 一个值**即可（源码 twitter-utils：
+      #   用 `auth_token=${e}` 构造 jar → 访问 x.com 让服务端下发 ct0 / guest token），
+      #   不需要整段 cookie，也不需要 consumer key。值来自 .env 的 TWITTER_AUTH_TOKEN。
+      - TWITTER_AUTH_TOKEN=${TWITTER_AUTH_TOKEN}
+      #
+      # ★ B 站：/bilibili/user/video/:uid 打的打分接口 x/space/wbi/arc/search 已要求登录态。
+      #   游客 cookie（buvid3）+ 完整 wbi 签名实测仍返回 412；Playwright 兜底等 45s 超时 → 503。
+      #   修法：给一条登录态 cookie 即可。
+      #   ⚠ 键名里的 uid 是【登录账号自己的 uid】，不是被订阅 UP 的 uid —— 别填订阅源的编号。
+      #   源码 config-DKa8H4Bg.mjs 按前缀 `BILIBILI_COOKIE_` 收集成 cookies 映射，
+      #   getConfiguredCookie() 取其中任意一条（b_lsid 会自动轮换）→ 配一条全站通用。
+      #   值来自 .env 的 BILIBILI_UID / BILIBILI_COOKIE（已 gitignore）。
+      #   ★ 到期时间写在 SESSDATA 第二段（Unix 时间戳），本机实测约 6 个月；
+      #     但风控会**提前**拒绝 —— 失效判据只有 `x/web-interface/nav` 的 isLogin，
+      #     自查方式：带 cookie 请求 `x/web-interface/nav`，看返回里的 isLogin。
+      - BILIBILI_COOKIE_${BILIBILI_UID}=${BILIBILI_COOKIE}
+      #
+      # ★ 知识星球：/zsxq/group/:id 与 /zsxq/user/:id 必须带登录态 access token，
+      #   否则 RSSHub 抛 "ConfigNotFoundError: ZSXQ_ACCESS_TOKEN is required"。
+      #   只需 token 一个值，不用整段 cookie。取法：用你自己的账号取得该 token，
+      #   填入 .env 的 ZSXQ_ACCESS_TOKEN（本项目不提供逐步抓取指引）。
+      #   值来自 .env 的 ZSXQ_ACCESS_TOKEN（已 gitignore）；有效期数天~数周，401 时重取。
+      - ZSXQ_ACCESS_TOKEN=${ZSXQ_ACCESS_TOKEN}
+      #
+      # 通用 HTML→RSS 抓取路由（/rsshub/transform/html/...）需要此开关。
+      # 自用实例、源全部可信，开启风险可控。
+      - ALLOW_USER_SUPPLY_UNSAFE_DOMAIN=true
+      #
+      # 高频轮询想省资源，可改接常驻浏览器（同时把上面镜像换成标准版 diygod/rsshub）：
+      # - PUPPETEER_WS_ENDPOINT=ws://browserless:3000
+    # ★ 镜像基于 Debian，没有 wget，只有 curl —— 用 wget 会一直 unhealthy
+    # /healthz 是 RSSHub 内建健康检查端点，比拉首页 HTML 轻
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS --max-time 10 http://127.0.0.1:1200/healthz || exit 1']
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
+    networks:
+      - diting
+
+  # ------------------------------------------------------------------
+  # 可选：常驻无头浏览器。高频轮询时可复用一个浏览器，
+  # 避免每次 token 过期都重新拉起 Chromium。
+  # 启用方式：取消下面注释 + 在 rsshub 里加 PUPPETEER_WS_ENDPOINT
+  #           + 把 rsshub 镜像换成 diygod/rsshub（非 bundled）
+  # ------------------------------------------------------------------
+  # browserless:
+  #   image: browserless/chrome:latest
+  #   container_name: diting-browserless
+  #   restart: unless-stopped
+  #   environment:
+  #     - MAX_CONCURRENT_SESSIONS=2
+  #     - PREBOOT_CHROME=true
+  #     - KEEP_ALIVE=true
+  #   networks:
+  #     - diting
+
+networks:
+  diting:
+    name: diting
+
+volumes:
+  postgres-data:
