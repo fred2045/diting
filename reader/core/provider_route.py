@@ -15,9 +15,11 @@ from django.conf import settings
 from core import settingkit as sk
 
 # 允许走 agnes 的任务白名单（显式集合，不搞隐式规则）。
-# 首期只有标题翻译：纯语言任务、短上下文短输出、质量敏感度低。
-# 将来放行新任务时往这里加一项即可，但必须先把它从下面的复杂任务集合里移出去。
-AGNES_TASKS = frozenset({"translate"})
+# 标题翻译：纯语言任务、短上下文短输出、质量敏感度低。
+# wiki_related：审批浮层「找找相关页」，宽口径提示、人不采纳就否掉（错误成本低）。
+# ★ 零 LLM 的 wiki_relate（确定式 token 相似度）和长上下文的 wiki 编译/对话都不在内。
+# 将来放行新任务时往这里加一项即可，但必须先确认它不在下面的复杂任务集合里。
+AGNES_TASKS = frozenset({"translate", "wiki_related"})
 
 # 永不走 agnes 的任务（判断型 / 长上下文 / 交互路径）。
 # ★ 这是程序闸门，不只是注释承诺：即使有人误把任务名加进 AGNES_TASKS，
@@ -27,9 +29,14 @@ AGNES_FORBIDDEN_TASKS = frozenset({
     "wiki_recommend", "conversation", "ingest", "grade", "classify",
 })
 
-# agnes 有 deepseek 整单兜底，失败要快：不让它吃满 3 次 × 90s。
-# 2 次（含首次）× 30s + 1s 退避 ≈ 61s 即降级；deepseek 仍按原 3×90s 走。
-AGNES_CALL_PARAMS = {"retries": 2, "timeout": 30}
+# agnes 有 deepseek 整单兜底，失败要快：不让它吃满重试预算。
+# translate：后台任务，2 次 × 30s + 1s 退避 ≈ 61s 即降级（ds 仍 3×90s）。
+# wiki_related：审批浮层自动 POST 是交互路径，2 次 × 15s + 1s ≈ 31s 即降级
+#   （ds 仍按 citeguard 的 2×180s；命中指纹缓存时零调用）。
+AGNES_CALL_PARAMS = {
+    "translate": {"retries": 2, "timeout": 30},
+    "wiki_related": {"retries": 2, "timeout": 15},
+}
 
 
 def has_agnes_key() -> bool:
@@ -67,5 +74,6 @@ def call_params(task: str, provider: str) -> dict:
     """
     if provider == "agnes" and task in AGNES_TASKS \
             and task not in AGNES_FORBIDDEN_TASKS:
-        return dict(AGNES_CALL_PARAMS)
+        params = AGNES_CALL_PARAMS.get(task)
+        return dict(params) if params else {}
     return {}

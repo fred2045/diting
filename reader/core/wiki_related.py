@@ -235,6 +235,9 @@ def recommend(slug: str) -> tuple:
         max_tokens=int(settings.WIKI_RELATED_MAX_TOKENS), temperature=0.1,
         pool=cr.POOL_WIKI, tag="wiki 相关页推荐", label=slug,
         max_calls=1,
+        # ★ KIND 就是路由键：开关开时走 agnes（2×15s 快失败）+ deepseek 兜底；
+        #   关时 citeguard 完全保持原调用（见 _call 的 route_task 分支）。
+        route_task=KIND,
         # ★ 一次性动作，不静默翻倍多打一次调用（见模块头「花钱边界」）。
         retry_on_empty=False, retry_on_truncated=False)
     if stats.get("truncated"):

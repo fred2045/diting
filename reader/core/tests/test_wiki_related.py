@@ -170,6 +170,8 @@ class SpendBoundaryTest(RelatedBase):
         self.assertIs(kw["retry_on_empty"], False, "静默翻倍会多花一次钱")
         self.assertIs(kw["retry_on_truncated"], False)
         self.assertEqual(kw["label"], self.slug)
+        # ★ 路由键就是 KIND：查相似才走可切 agnes 的口，其它 wiki 任务不受影响
+        self.assertEqual(kw.get("route_task"), wr.KIND)
         # ★ 材料非空，且目录卡里有页：不能拿空集合糊弄出一次「成功」。
         material = json.loads(call.call_args.args[2])
         self.assertEqual(len(material["pages"]), 2)

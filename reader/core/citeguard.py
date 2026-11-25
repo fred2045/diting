@@ -9,6 +9,8 @@
 依赖边界（刻意最小）：
   - `costreport.chat_recorded`：记账 + 预算闸的**唯一出口**，业务方不许绕过。
   - `settingkit.effective`：读调用上限等设置（走 15s 缓存）。
+  - `provider_route`：仅当调用方显式传 `route_task` 时才读（按任务选 provider）；
+    不传则完全走原来的 `chat_recorded`，几十个既有调用点/测试桩不受影响。
   - `reporttext.count_cites`：引用计数（纯函数，无 LLM 依赖）。
   - `jsontool.strip_code_fence`：去 markdown 围栏。
 
@@ -19,6 +21,7 @@ import logging
 
 from core import costreport as cr
 from core import jsontool
+from core import provider_route
 from core import settingkit as sk
 from core.reporttext import count_cites
 
@@ -42,7 +45,7 @@ def fresh_stats() -> dict:
 def _call(kind, system, user, stats, *, feed_id=None, category_id=None, run_id=None,
           max_tokens=2048, temperature=0.2, tag="", label="", retry_on_empty=True,
           retry_on_truncated=False, reserve=0, pool=None, max_calls=None,
-          messages=None, tools=None, entry_id=None):
+          messages=None, tools=None, entry_id=None, route_task=None):
     """带双闸（单次调用上限 + 池预算）的调用 + 记账。返回 (text, err)。
 
     ★ 推理模型的坑（实测 deepseek-flash）：推理链 token 计入 completion_tokens，
@@ -74,6 +77,9 @@ def _call(kind, system, user, stats, *, feed_id=None, category_id=None, run_id=N
       最终仍截断才写 `stats["truncated"]`，且**只写一次**（写了两次会让报告头重复点名）。
     ★ `entry_id`：只用于记账。此前日报的 `LlmUsage.entry_id` 全是 NULL，
       报告里那句「S3 单篇 …」在成本页对不回具体文章。
+    ★ `route_task`（2026-11-25）：给了任务键才可能按路由走 agnes + deepseek 兜底；
+      不传 / 开关关 / 任务不在白名单，一律走原来的 `chat_recorded`（行为零变化）。
+      兜底那次仍用本函数的 `retries=2, timeout=180`，只有主通道被短参数覆盖。
     """
     cap = max(0, int(max_calls if max_calls is not None
                      else sk.effective("summary_max_calls"))
@@ -96,13 +102,22 @@ def _call(kind, system, user, stats, *, feed_id=None, category_id=None, run_id=N
     #: 撞顶时拿到的半截正文。第二次连正文都没了就用它兜底 —— 开了开关也绝不比
     #: 不开更差（这是「重试」相对「直接用半截」唯一必须守住的底线）。
     partial, partial_budget = "", budget
+    # ★ max_tokens 绝不塞进 call_kw：翻倍重试会改 budget，抽出去就会静默用旧预算，
+    #   让「撞顶翻倍」变成「按原预算再打一次」（test_call_truncation 钉死这点）。
+    call_kw = dict(pool=pool or cr.POOL_SUMMARY, temperature=temperature,
+                   retries=2, timeout=180,
+                   feed_id=feed_id, category_id=category_id, summary_run_id=run_id,
+                   entry_id=entry_id, tools=tools)
+    # 一次 _call 只读一次路由（同一笔调用不中途换通道）；兜底仍用上面的原参数。
+    use_fallback = bool(route_task) and provider_route.resolve(route_task) == "agnes"
     for attempt in range(attempts):
-        res = cr.chat_recorded(
-            kind, messages,
-            pool=pool or cr.POOL_SUMMARY, temperature=temperature, max_tokens=budget,
-            retries=2, timeout=180,
-            feed_id=feed_id, category_id=category_id, summary_run_id=run_id,
-            entry_id=entry_id, tools=tools)
+        if use_fallback:
+            res = cr.chat_recorded_with_fallback(
+                kind, messages, primary="agnes", fallback="deepseek",
+                primary_params=provider_route.call_params(route_task, "agnes"),
+                max_tokens=budget, **call_kw)
+        else:
+            res = cr.chat_recorded(kind, messages, max_tokens=budget, **call_kw)
         if res.budget_stop:
             stats["budget_stop"] = True
             # ★ 按池名说话：原先写死「日报池」，wiki 对话超限时会 log 成日报池，

@@ -98,6 +98,11 @@ GROUPS = [
         Field("weekly_retry_hours", "等当天日报（小时）", "int", "instant", 0, 12,
               help="当天日报还没出来时最多再等几小时；缺的是**历史**日报则立即失败并通知"),
     ]),
+    Group("wiki", "知识库", [
+        Field("wiki_related_prefer_agnes", "查相似优先 Agnès", "bool",
+              help="审批浮层「找找相关页」优先走 Agnès（免费但限速），失败自动回退 DeepSeek；"
+                   "需配置 AGNES_API_KEY"),
+    ]),
     Group("notify", "系统通知", [
         Field("notify_enable", "启用系统通知", "bool",
               help="关闭后所有系统通知静默（分级与推送不受影响）"),

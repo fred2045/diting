@@ -16,6 +16,7 @@ from django.conf import settings
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 
+from core import citeguard
 from core import costreport as cr
 from core import llm, provider_route, translate as tr
 from core.models import AppSetting, LlmUsage
@@ -87,8 +88,18 @@ class CallParamsTest(SimpleTestCase):
         self.assertEqual(provider_route.call_params("translate", "agnes"),
                          {"retries": 2, "timeout": 30})
 
+    def test_wiki_related_uses_interactive_short_params(self):
+        # 审批浮层是交互路径：比后台翻译更急，失败 31s 内即回退
+        self.assertEqual(provider_route.call_params("wiki_related", "agnes"),
+                         {"retries": 2, "timeout": 15})
+
+    def test_other_wiki_tasks_never_use_agnes_params(self):
+        for task in ("wiki", "wiki_compile", "wiki_relate", "wiki_recommend"):
+            self.assertEqual(provider_route.call_params(task, "agnes"), {}, task)
+
     def test_deepseek_and_unknown_keep_original_params(self):
         self.assertEqual(provider_route.call_params("translate", "deepseek"), {})
+        self.assertEqual(provider_route.call_params("wiki_related", "deepseek"), {})
         self.assertEqual(provider_route.call_params("bogus", "agnes"), {})
 
     def test_returned_params_are_a_copy(self):
@@ -110,6 +121,21 @@ class RouteDbTest(TestCase):
                 self.assertEqual(provider_route.resolve("translate"), "agnes")
         finally:
             AppSetting.objects.filter(key="translate_prefer_agnes").delete()
+            cache.clear()
+
+    def test_wiki_related_flag_on_with_key_is_agnes(self):
+        from django.core.cache import cache
+        cache.clear()
+        AppSetting.objects.update_or_create(key="wiki_related_prefer_agnes",
+                                            defaults={"value": "1"})
+        cache.clear()
+        try:
+            with override_settings(AGNES_API_KEY="sk-test"):
+                self.assertEqual(provider_route.resolve("wiki_related"), "agnes")
+                # 同属 wiki，但编译/对话是复杂任务，不能被顺带切过去
+                self.assertEqual(provider_route.resolve("wiki_compile"), "deepseek")
+        finally:
+            AppSetting.objects.filter(key="wiki_related_prefer_agnes").delete()
             cache.clear()
 
 
@@ -248,3 +274,43 @@ class TranslateCallTest(SimpleTestCase):
         kw = mds.call_args.kwargs
         self.assertNotIn("primary_params", kw)
         self.assertEqual((kw["retries"], kw["timeout"]), (3, 90))
+
+
+class CiteguardRouteTest(SimpleTestCase):
+    """★ citeguard._call 是几十处共用口：没给 route_task 时一个字都不许变。"""
+
+    def _call(self, resolved=None, **extra):
+        fake = R("[]", {}, "", False, None)
+        with mock.patch.object(provider_route, "resolve",
+                               return_value=resolved) as route, \
+             mock.patch.object(cr, "chat_recorded", return_value=fake) as mds, \
+             mock.patch.object(cr, "chat_recorded_with_fallback",
+                               return_value=fake) as mfb:
+            citeguard._call("wiki_related", "sys", "user",
+                            citeguard.fresh_stats(),
+                            pool=cr.POOL_WIKI, max_calls=1, **extra)
+        return route, mds, mfb
+
+    def test_route_task_on_uses_fallback_with_short_params(self):
+        _route, mds, mfb = self._call("agnes", route_task="wiki_related")
+        mds.assert_not_called()
+        mfb.assert_called_once()
+        kw = mfb.call_args.kwargs
+        self.assertEqual((kw["primary"], kw["fallback"]), ("agnes", "deepseek"))
+        self.assertEqual(kw["primary_params"], {"retries": 2, "timeout": 15})
+        # ★ 兜底那次仍用 citeguard 原参数，不跟着主通道一起缩短
+        self.assertEqual((kw["retries"], kw["timeout"]), (2, 180))
+
+    def test_route_task_off_keeps_original_call(self):
+        _route, mds, mfb = self._call("deepseek", route_task="wiki_related")
+        mfb.assert_not_called()
+        mds.assert_called_once()
+        kw = mds.call_args.kwargs
+        self.assertNotIn("primary_params", kw)
+        self.assertEqual((kw["retries"], kw["timeout"]), (2, 180))
+
+    def test_no_route_task_never_even_reads_router(self):
+        _route, mds, mfb = self._call(None)
+        _route.assert_not_called()
+        mds.assert_called_once()
+        mfb.assert_not_called()

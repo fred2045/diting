@@ -447,6 +447,9 @@ WIKI_INGEST_MAX_CANDIDATES = int(env("WIKI_INGEST_MAX_CANDIDATES", "6"))
 # ★ 这次**不开**「撞顶自动翻倍重试」：它是人主动点的一次性动作，失败/截断会
 #   在浮层里说清楚并让人再点一次；静默多打一次调用正是用户明确不想要的。
 WIKI_RELATED_MAX_TOKENS = int(env("WIKI_RELATED_MAX_TOKENS", "4096"))
+# 审批浮层「找找相关页」是否优先走 agnes（默认关 = 行为与迁移前一致）。
+# 交互路径：agnes 侧 2 次 × 15s 仍失败即回退 deepseek；可在 /prefs 即时切换。
+WIKI_RELATED_PREFER_AGNES = env("WIKI_RELATED_PREFER_AGNES", "0") == "1"
 
 # ---------------------------------------------------------------- 日志
 # ★ 级别约定 / 字段命名 / 脱敏规则都在 `core/logkit.py` 模块头 —— 加日志前先读它。

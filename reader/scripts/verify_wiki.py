@@ -1067,6 +1067,21 @@ check("★★ 上限进指纹（放宽后旧缓存自动 stale，否则浮层仍
 check("★ 预算随条数抬到 4096（3072 历史 85 次撞顶 1 次）",
       '"WIKI_RELATED_MAX_TOKENS", "4096"' in SETTINGS_T)
 
+# ---- 2026-11-25：查相似优先 agnes（交互路径，快失败 + deepseek 兜底） ----
+CG_T = read("core/citeguard.py")
+SK_T = read("core/settingkit.py")
+check("★ 查相似走可路由的调用口（KIND 就是路由键）",
+      "route_task=KIND" in RELATED_T
+      and "WIKI_RELATED_PREFER_AGNES" in SETTINGS_T
+      and "wiki_related_prefer_agnes" in SK_T)
+check("★★ citeguard 没给 route_task 时仍走原出口（几十处共用口零变化）",
+      "route_task=None" in CG_T
+      and "use_fallback = bool(route_task)" in CG_T
+      # ★ 必须显式带 max_tokens=budget：抽出 call_kw 会让翻倍重试静默失效
+      and "cr.chat_recorded(kind, messages, max_tokens=budget, **call_kw)" in CG_T)
+check("★ 交互路径 agnes 快失败：2 次 × 15s（后台翻译才是 30s）",
+      '"wiki_related": {"retries": 2, "timeout": 15}' in read("core/provider_route.py"))
+
 # ------------------------------------------------ 对话长文分片（2026-11-15）
 # 用户报的原话：「正文超 6000 字被截断……长文总结不可用了」。
 # ★ 行为判据在 `core/tests/test_conversation_chunked.py`（那边验「全文真被读到」）。
