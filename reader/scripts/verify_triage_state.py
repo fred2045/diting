@@ -658,6 +658,54 @@ check("★ chunked 断流走客户端重试，不打断整轮 triage",
       and "http.client.HTTPException" in _fn_slice(_llm_src, "chat_stream"),
       "IncompleteRead 是 HTTPException 不是 URLError：漏掉它重试与记账全失效")
 
+# 2026-11-25：分级切 agnes（免费侧）+ deepseek 兜底。守卫钉死三件事：
+#   ① 三处投票调用（批量首票 / 批量补票 / 单条判定）都走 _chat_triage 唯一出口；
+#   ② agnes 失败走 chat_recorded_with_fallback 整单降级 ds，fail_open 只在双失败时；
+#   ③ 票数不动（triage_repeat 默认 3、不加票补偿 —— 多票会把 L0 洗成非 L0）。
+print()
+print("=" * 68)
+print("11. 分级 agnes 路由：三处调用统一出口 + 票数不动（2026-11-25）")
+print("=" * 68)
+from core import provider_route as pr  # noqa: E402
+
+TRIAGE_SRC = open(os.path.join(BASE, "core", "triage.py"), encoding="utf-8").read()
+ROUTE_SRC = open(os.path.join(BASE, "core", "provider_route.py"), encoding="utf-8").read()
+SETTINGS_SRC3 = open(os.path.join(BASE, "config", "settings.py"), encoding="utf-8").read()
+
+check("★ triage 在 agnes 白名单、且不在禁止名单（复核后放行）",
+      "triage" in pr.AGNES_TASKS and "triage" not in pr.AGNES_FORBIDDEN_TASKS,
+      sorted(pr.AGNES_TASKS))
+check("★ triage agnes 参数是后台宽松档 {2,30}（ds 兜底不缩水）",
+      pr.call_params("triage", "agnes") == {"retries": 2, "timeout": 30},
+      pr.call_params("triage", "agnes"))
+check("★ 其余复杂任务仍在禁止名单（分级放行不牵连 wiki/日报）",
+      {"summary", "weekly", "wiki", "wiki_compile",
+       "wiki_relate", "conversation", "ingest"}.issubset(pr.AGNES_FORBIDDEN_TASKS),
+      sorted(pr.AGNES_FORBIDDEN_TASKS))
+check("★ 设置项与默认值存在（默认关 = 行为与迁移前一致）",
+      "TRIAGE_PREFER_AGNES" in SETTINGS_SRC3
+      and 'env("TRIAGE_PREFER_AGNES", "0")' in SETTINGS_SRC3)
+
+_helper = _fn_slice(TRIAGE_SRC, "_chat_triage")
+check("★ 唯一出口：开关开走 fallback 整单降级 ds，关走 chat_recorded 原样",
+      "chat_recorded_with_fallback" in _helper
+      and "primary_params" in _helper
+      and "chat_recorded" in _helper,
+      _helper[:200])
+check("★ 三处投票调用（批量首票/补票/单条）都走 _chat_triage，没有漏网的直调",
+      TRIAGE_SRC.count("_chat_triage(") == 4  # 1 定义 + 3 调用
+      and 'cr.chat_recorded(\n            "triage"' not in TRIAGE_SRC,
+      "调用点计数=%s" % TRIAGE_SRC.count("_chat_triage("))
+check("★ 三层失败语义写进出口 docstring（agnes 败→ds；双败才 fail_open）",
+      "双双失败" in _helper and "不会" in _helper,
+      _helper[:400])
+check("★ 票数常量与聚合 untouched（MIN_VOTES_FOR_L0=2、不加票补偿）",
+      TRIAGE_SRC.count("MIN_VOTES_FOR_L0 = 2") == 1
+      and "triage_repeat_agnes" not in TRIAGE_SRC
+      and "^def _chat_triage" not in _fn_slice(TRIAGE_SRC, "aggregate_level")
+      and "primary_params" not in _fn_slice(TRIAGE_SRC, "aggregate_level"),
+      "不许加票补偿（多票会把 L0 洗成非 L0 且加重限流）")
+
 print()
 print("=" * 68)
 print("结果：%d 通过 / %d 失败" % (ok, bad))

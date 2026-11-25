@@ -175,6 +175,9 @@ TRIAGE_SCAN_LIMIT = int(env("TRIAGE_SCAN_LIMIT", "1000"))   # /v1/entries 单次
 TRIAGE_BATCH_SIZE = int(env("TRIAGE_BATCH_SIZE", "10"))
 TRIAGE_REPEAT = int(env("TRIAGE_REPEAT", "3"))              # 每条最多几票
 TRIAGE_ADAPTIVE = env("TRIAGE_ADAPTIVE", "1") == "1"        # 只有 L0 才补满票
+# ★ 分级优先走 agnes（免费但限速），失败整单降级 deepseek；默认 False = 行为与迁移前一致。
+#   agnes 与 ds 双双失败才 fail_open 掉 default_level；票数恒为 TRIAGE_REPEAT（不加票）。
+TRIAGE_PREFER_AGNES = env("TRIAGE_PREFER_AGNES", "0") == "1"
 TRIAGE_MAX_CALLS = int(env("TRIAGE_MAX_CALLS", "60"))       # 单次 run 的调用上限
 TRIAGE_CHAR_LIMIT = int(env("TRIAGE_CHAR_LIMIT", "900"))    # 单条喂给模型的字数
 

@@ -24,6 +24,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from core import costreport as cr
+from core import provider_route
 from core import jsontool, llm, promptbuilder, promptspec, settingkit as sk, treekit
 from core.datasource import get_datasource
 from core.logkit import fields
@@ -34,6 +35,31 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 MIN_VOTES_FOR_L0 = 2
+
+
+def _chat_triage(messages, *, temperature, max_tokens, retries, timeout,
+                 feed_id, category_id):
+    """分级唯一的 LLM 调用出口：开关开 → agnes 优先、整单降级 deepseek；关 → 原样。
+
+    ★ 每票各调一次本函数（批量首票 / 批量补票 / 单条判定），故「前两票 agnes 成功、
+      第三票 agnes 失败自动转 ds」天然成立 —— 第三票由
+      `chat_recorded_with_fallback` 内部换 provider 重跑，不牵连前两票，票箱照常聚合。
+    ★ 失败层级（用户 2026-11-25 确认）：agnes 失败 → ds 兜底；只有 **agnes 与 ds
+      双双失败**才返回非空 err → 调用方走 fail_open 掉 default_level。
+      agnes 失败本身**不会**直接 fail_open。
+    ★ 票数不在这里改：`triage_repeat` 默认 3、anti-FOMO 聚合全票 L0 才判 L0，
+      多投一票只会把 L0 洗成非 L0（漏丢）且加重限流 —— 故不加票、不搞票数补偿。
+    ★ 开关关时 `chat_recorded` 的调用形状一个字不变（几十个测试桩钉死这一路径）；
+      `chat_recorded_with_fallback` 的兜底那次用 kwargs 原值，ds 的 3×90s 不缩水。
+    """
+    kw = dict(pool=cr.POOL_TRIAGE, temperature=temperature, max_tokens=max_tokens,
+              retries=retries, timeout=timeout,
+              feed_id=feed_id, category_id=category_id)
+    if provider_route.resolve("triage") == "agnes":
+        return cr.chat_recorded_with_fallback(
+            "triage", messages, primary="agnes", fallback="deepseek",
+            primary_params=provider_route.call_params("triage", "agnes"), **kw)
+    return cr.chat_recorded("triage", messages, **kw)
 
 
 def votes_done(levels, repeat: int, adaptive: bool) -> bool:
@@ -491,9 +517,8 @@ def _run_once(feed_ids=None, dry_run=False, max_calls=None):
             messages = [{"role": "system", "content": promptspec.BASE_SYSTEM},
                         {"role": "user", "content": user}]
 
-            res = cr.chat_recorded(
-                "triage", messages, pool=cr.POOL_TRIAGE,
-                temperature=0.1, max_tokens=4096, retries=3, timeout=90,
+            res = _chat_triage(
+                messages, temperature=0.1, max_tokens=4096, retries=3, timeout=90,
                 feed_id=feed_id, category_id=category_id)
             if res.budget_stop:
                 stats["budget_stop"] = True
@@ -525,9 +550,8 @@ def _run_once(feed_ids=None, dry_run=False, max_calls=None):
                                   {"role": "user",
                                    "content": base_prompt + "\n\n===== 待判定的条目 =====\n"
                                    + _render_items([e])}]
-                        r2 = cr.chat_recorded(
-                            "triage", single, pool=cr.POOL_TRIAGE,
-                            temperature=0.1, max_tokens=2048, retries=2, timeout=90,
+                        r2 = _chat_triage(
+                            single, temperature=0.1, max_tokens=2048, retries=2, timeout=90,
                             feed_id=feed_id, category_id=category_id)
                         if r2.budget_stop:
                             # 补票也要过闸：钱不够就用已有票聚合（<2 票永不判 L0）
@@ -649,11 +673,9 @@ def _rate_single(entry_id, force=False):
     votes, err = [], ""
     for i in range(min(max(1, sk.effective("triage_repeat")), 3)):
         user = base + "\n\n===== 待判定的条目 =====\n" + _render_items([entry])
-        res = cr.chat_recorded(
-            "triage",
+        res = _chat_triage(
             [{"role": "system", "content": promptspec.BASE_SYSTEM},
              {"role": "user", "content": user}],
-            pool=cr.POOL_TRIAGE,
             temperature=0.1, max_tokens=4096 if i == 0 else 2048,
             retries=2, timeout=90,
             feed_id=feed_id, category_id=category_id)

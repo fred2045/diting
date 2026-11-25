@@ -18,7 +18,7 @@ from django.utils import timezone
 
 from core import citeguard
 from core import costreport as cr
-from core import llm, provider_route, translate as tr
+from core import llm, provider_route, translate as tr, triage
 from core.models import AppSetting, LlmUsage
 
 R = cr.ChatResult
@@ -59,8 +59,9 @@ class RouteTest(SimpleTestCase):
 
     def test_non_whitelisted_task_always_deepseek(self):
         with override_settings(AGNES_API_KEY="sk-test"):
-            self.assertEqual(provider_route.resolve("triage"), "deepseek")
+            # triage 已于 2026-11-25 复核后移入白名单（见 TriageRouteTest）
             self.assertEqual(provider_route.resolve("summary"), "deepseek")
+            self.assertEqual(provider_route.resolve("weekly"), "deepseek")
 
     def test_unknown_task_key_is_deepseek(self):
         # settingkit 注册表里没有的任务 → 开关视为关，不能 500
@@ -92,6 +93,11 @@ class CallParamsTest(SimpleTestCase):
         # 审批浮层是交互路径：比后台翻译更急，失败 31s 内即回退
         self.assertEqual(provider_route.call_params("wiki_related", "agnes"),
                          {"retries": 2, "timeout": 15})
+
+    def test_triage_uses_background_short_params(self):
+        # 分级是后台 scheduler，慢点无害，与翻译同档（ds 兜底仍用原参数）
+        self.assertEqual(provider_route.call_params("triage", "agnes"),
+                         {"retries": 2, "timeout": 30})
 
     def test_other_wiki_tasks_never_use_agnes_params(self):
         for task in ("wiki", "wiki_compile", "wiki_relate", "wiki_recommend"):
@@ -136,6 +142,36 @@ class RouteDbTest(TestCase):
                 self.assertEqual(provider_route.resolve("wiki_compile"), "deepseek")
         finally:
             AppSetting.objects.filter(key="wiki_related_prefer_agnes").delete()
+            cache.clear()
+
+    def test_triage_flag_on_with_key_is_agnes(self):
+        from django.core.cache import cache
+        cache.clear()
+        AppSetting.objects.update_or_create(key="triage_prefer_agnes",
+                                            defaults={"value": "1"})
+        cache.clear()
+        try:
+            with override_settings(AGNES_API_KEY="sk-test"):
+                self.assertEqual(provider_route.resolve("triage"), "agnes")
+                # 分级切了不等于日报/周报也切 —— 其余复杂任务闸门仍在
+                self.assertEqual(provider_route.resolve("summary"), "deepseek")
+                self.assertEqual(provider_route.resolve("weekly"), "deepseek")
+                self.assertEqual(provider_route.resolve("wiki_compile"), "deepseek")
+        finally:
+            AppSetting.objects.filter(key="triage_prefer_agnes").delete()
+            cache.clear()
+
+    def test_triage_flag_on_without_key_stays_deepseek(self):
+        from django.core.cache import cache
+        cache.clear()
+        AppSetting.objects.update_or_create(key="triage_prefer_agnes",
+                                            defaults={"value": "1"})
+        cache.clear()
+        try:
+            with override_settings(AGNES_API_KEY=""):
+                self.assertEqual(provider_route.resolve("triage"), "deepseek")
+        finally:
+            AppSetting.objects.filter(key="triage_prefer_agnes").delete()
             cache.clear()
 
 
@@ -314,3 +350,136 @@ class CiteguardRouteTest(SimpleTestCase):
         _route.assert_not_called()
         mds.assert_called_once()
         mfb.assert_not_called()
+
+
+class TriageChatCallTest(SimpleTestCase):
+    """★ 分级唯一调用出口：开关形状 + agnes 失败先降级 ds（不是直接 fail_open）。"""
+
+    ROW = '[{"id":42,"level":2,"why":"具体标的"}]'
+
+    def _call(self, resolved):
+        fake = R(self.ROW, {}, "", False, None)
+        with mock.patch.object(provider_route, "resolve", return_value=resolved), \
+             mock.patch.object(cr, "chat_recorded_with_fallback",
+                               return_value=fake) as mfb, \
+             mock.patch.object(cr, "chat_recorded", return_value=fake) as mds:
+            res = triage._chat_triage(
+                [{"role": "user", "content": "x"}], temperature=0.1,
+                max_tokens=4096, retries=3, timeout=90, feed_id=7, category_id=2)
+        return res, mfb, mds
+
+    def test_flag_on_uses_fallback_with_short_primary_params(self):
+        res, mfb, mds = self._call("agnes")
+        mds.assert_not_called()
+        mfb.assert_called_once()
+        kw = mfb.call_args.kwargs
+        self.assertEqual((kw["primary"], kw["fallback"]), ("agnes", "deepseek"))
+        self.assertEqual(kw["primary_params"], {"retries": 2, "timeout": 30})
+        # ★ 兜底那次仍用 triage 原参数，ds 的 3×90s 不跟着缩水
+        self.assertEqual((kw["retries"], kw["timeout"]), (3, 90))
+        self.assertEqual((kw["max_tokens"], kw["feed_id"], kw["category_id"]),
+                         (4096, 7, 2))
+        self.assertEqual(triage.parse_rows(res.text)[0]["level"], 2)
+
+    def test_flag_off_keeps_original_call_shape(self):
+        res, mfb, mds = self._call("deepseek")
+        mfb.assert_not_called()
+        mds.assert_called_once()
+        kw = mds.call_args.kwargs
+        self.assertNotIn("primary_params", kw)
+        self.assertNotIn("primary", kw)
+        self.assertEqual((kw["retries"], kw["timeout"], kw["max_tokens"]),
+                         (3, 90, 4096))
+        self.assertEqual(triage.parse_rows(res.text)[0]["level"], 2)
+
+    def test_agnes_fails_ds_succeeds_returns_parsable_rows(self):
+        """★ agnes 429 → ds 兜底：调用方拿到的是 ds 的合法正文，不是 fail_open。"""
+        ds_result = R(self.ROW, {}, "", False)
+        with mock.patch.object(provider_route, "resolve", return_value="agnes"), \
+             mock.patch.object(cr, "chat_recorded", side_effect=[
+                 R("", {}, "HTTPError: HTTP Error 429", False), ds_result]):
+            res = triage._chat_triage(
+                [], temperature=0.1, max_tokens=4096, retries=3, timeout=90,
+                feed_id=1, category_id=1)
+        self.assertFalse(res.err, "ds 兜住后 err 应为空")
+        self.assertEqual(triage.parse_rows(res.text)[0]["level"], 2,
+                         "调用方应能从 ds 结果里正常取票")
+
+    def test_both_providers_fail_returns_err_to_caller(self):
+        """agnes 与 ds 双双失败 → err 非空 → 调用方才走 fail_open。"""
+        with mock.patch.object(provider_route, "resolve", return_value="agnes"), \
+             mock.patch.object(cr, "chat_recorded", side_effect=[
+                 R("", {}, "429", False), R("", {}, "ds 也失败", False)]):
+            res = triage._chat_triage(
+                [], temperature=0.1, max_tokens=4096, retries=3, timeout=90,
+                feed_id=1, category_id=1)
+        self.assertEqual(res.err, "ds 也失败")
+
+    def test_budget_stop_propagates_without_degrade(self):
+        """闸下不降级（否则绕过预算闸），budget_stop 原样交回调用方。"""
+        with mock.patch.object(provider_route, "resolve", return_value="agnes"), \
+             mock.patch.object(cr, "chat_recorded",
+                               return_value=R("", {}, "预算已用尽", True)) as m:
+            res = triage._chat_triage(
+                [], temperature=0.1, max_tokens=4096, retries=3, timeout=90,
+                feed_id=1, category_id=1)
+        self.assertTrue(res.budget_stop)
+        self.assertEqual(m.call_count, 1, "闸下只调一次，不换 provider 重跑")
+
+
+class TriageMixedVoteTest(SimpleTestCase):
+    """★★ 用户点名的边界：agnes 前两票成功、第三票失败降级 ds —— 票箱照常聚合。
+
+    每票是独立的 `_chat_triage` 调用，第三票由 fallback 内部换 ds 重跑、不牵连前两票。
+    这里用**真的 res.text** 走真的 `parse_rows` + `aggregate_level`，验证三票都进票箱、
+    聚合照常、来源混合不影响结论 —— 而不是手塞票再自证。
+    """
+
+    def _vote_text(self, level, why):
+        return '[{"id":42,"level":%d,"why":"%s"}]' % (level, why)
+
+    def test_two_agnes_one_ds_votes_aggregate_normally(self):
+        # 三票真文本：票1/2 = agnes 成功直出；票3 = agnes 429 → ds 兜底成功
+        texts = [
+            self._vote_text(2, "agnes 说具体标的"),
+            self._vote_text(2, "agnes 说有增量"),
+            self._vote_text(2, "ds 兜底说具体标的"),
+        ]
+        votes = []
+        with mock.patch.object(provider_route, "resolve", return_value="agnes"):
+            for i, text in enumerate(texts):
+                seq = ([R("", {}, "HTTP 429", False), R(text, {}, "", False)]
+                       if i == 2 else [R(text, {}, "", False)])
+                with mock.patch.object(cr, "chat_recorded", side_effect=seq):
+                    res = triage._chat_triage(
+                        [], temperature=0.1, max_tokens=4096,
+                        retries=3, timeout=90, feed_id=1, category_id=1)
+                self.assertFalse(res.err, "每票都应有合法正文（第三票由 ds 兜住）")
+                rows = [r for r in triage.parse_rows(res.text) if r["id"] == 42]
+                self.assertEqual(len(rows), 1, "每票都应能解析出一条有效票")
+                votes.append(rows[0])
+        self.assertEqual(len(votes), 3, "部分票降级 ds 不该让票箱变短")
+        level, info = triage.aggregate_level(votes, default_level=2)
+        self.assertEqual(level, 2)
+        self.assertEqual(info["counts"], {"2": 3})
+        self.assertTrue(any("ds" in v["why"] for v in votes), "第三票应来自 ds")
+        self.assertTrue(any("agnes" in v["why"] for v in votes), "前两票应来自 agnes")
+
+    def test_agnes_all_fail_ds_all_succeed_votes_intact(self):
+        """agnes 票票 429 → 票票降级 ds：三票齐全，聚合照常，不 fail_open。"""
+        text = self._vote_text(3, "ds 兜底说点名标的")
+        votes = []
+        with mock.patch.object(provider_route, "resolve", return_value="agnes"):
+            for _ in range(3):
+                with mock.patch.object(cr, "chat_recorded", side_effect=[
+                        R("", {}, "429", False), R(text, {}, "", False)]):
+                    res = triage._chat_triage(
+                        [], temperature=0.1, max_tokens=4096,
+                        retries=3, timeout=90, feed_id=1, category_id=1)
+                rows = [r for r in triage.parse_rows(res.text) if r["id"] == 42]
+                self.assertEqual(len(rows), 1)
+                votes.append(rows[0])
+        level, info = triage.aggregate_level(votes, default_level=2)
+        self.assertEqual(level, 3)
+        self.assertEqual(info["counts"], {"3": 3}, "三票全由 ds 兜住，票箱完整")
+

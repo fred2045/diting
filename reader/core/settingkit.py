@@ -51,6 +51,9 @@ GROUPS = [
               help="票数上限；自适应开启时只有「全是 L0」才用到满票，关闭时每条跑满"),
         Field("triage_adaptive", "自适应投票", "bool",
               help="逐票评估：出现 L2/L3 即停、L1 满 2 票定、全 L0 满票才判（省调用）"),
+        Field("triage_prefer_agnes", "分级优先 Agnès", "bool",
+              help="开启后分级优先走 Agnès（免费但限速），失败自动回退 DeepSeek；"
+                   "需配置 AGNES_API_KEY。票数不变，仍按上面「每条投票次数」走"),
         Field("triage_lookback_days", "判级窗口（天）", "int", "instant", 1, 60,
               help="只判最近 N 天发布的条目，更早的按设计永不判"),
         Field("triage_max_calls", "单轮调用上限", "int", "instant", 1, 500,

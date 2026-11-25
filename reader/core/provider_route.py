@@ -17,24 +17,32 @@ from core import settingkit as sk
 # 允许走 agnes 的任务白名单（显式集合，不搞隐式规则）。
 # 标题翻译：纯语言任务、短上下文短输出、质量敏感度低。
 # wiki_related：审批浮层「找找相关页」，宽口径提示、人不采纳就否掉（错误成本低）。
+# triage：分级。27 条人工复核里 agnes 判断力不弱于 ds（4 条分歧赢 3 平 1），
+#   短板只是 429/偶发漏返回 —— 由 chat_recorded_with_fallback 整单降级 ds 兜住，
+#   且 fail_open 只在 agnes 与 ds 双双失败时才发生。详见
+#   docs/design/bench_triage_report.md（不入库）。★ 票数保持 3、不搞票数补偿。
 # ★ 零 LLM 的 wiki_relate（确定式 token 相似度）和长上下文的 wiki 编译/对话都不在内。
 # 将来放行新任务时往这里加一项即可，但必须先确认它不在下面的复杂任务集合里。
-AGNES_TASKS = frozenset({"translate", "wiki_related"})
+AGNES_TASKS = frozenset({"translate", "wiki_related", "triage"})
 
-# 永不走 agnes 的任务（判断型 / 长上下文 / 交互路径）。
+# 永不走 agnes 的任务（长上下文 / 判断型且不可逆 / 交互路径）。
 # ★ 这是程序闸门，不只是注释承诺：即使有人误把任务名加进 AGNES_TASKS，
 #   resolve() 与 call_params() 仍会把它按 deepseek 处理（测试钉死）。
+# ★ triage 已于 2026-11-25 复核后移出（并入白名单），其余仍是复杂/长文任务。
 AGNES_FORBIDDEN_TASKS = frozenset({
-    "triage", "summary", "weekly", "wiki", "wiki_compile", "wiki_relate",
+    "summary", "weekly", "wiki", "wiki_compile", "wiki_relate",
     "wiki_recommend", "conversation", "ingest", "grade", "classify",
 })
 
 # agnes 有 deepseek 整单兜底，失败要快：不让它吃满重试预算。
 # translate：后台任务，2 次 × 30s + 1s 退避 ≈ 61s 即降级（ds 仍 3×90s）。
+# triage：后台 scheduler，慢点无害，与翻译同档 2×30s（ds 仍按 triage 原 3×90s /
+#   2×90s 补票，不跟着缩短）；限流时多花的只是免费侧的失败调用。
 # wiki_related：审批浮层自动 POST 是交互路径，2 次 × 15s + 1s ≈ 31s 即降级
 #   （ds 仍按 citeguard 的 2×180s；命中指纹缓存时零调用）。
 AGNES_CALL_PARAMS = {
     "translate": {"retries": 2, "timeout": 30},
+    "triage": {"retries": 2, "timeout": 30},
     "wiki_related": {"retries": 2, "timeout": 15},
 }
 
