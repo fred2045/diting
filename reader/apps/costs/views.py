@@ -76,6 +76,7 @@ def index(request):
         "day_link_extra": "&" + urllib.parse.urlencode(keep),
         "tops": cr.top_feeds_range(rng, titles=feeds),
         "cats": cr.by_category_range(rng, cat_titles=cats, feed_to_cat=feed_to_cat),
+        "providers": cr.by_provider_range(rng),
         "table": cr.feed_table_range(rng, sort=sort, direction=direction,
                                      titles=feeds),
         "budget": cr.budget_status(),

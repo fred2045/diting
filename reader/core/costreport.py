@@ -18,6 +18,7 @@
 近 30 天 / 本月 / 上月 / 自定义。单日区间自动切到**按小时**视图。
 区间是**闭区间**（含 start 与 end 两个自然日）。
 """
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import NamedTuple, Optional
@@ -26,7 +27,10 @@ from django.conf import settings
 from django.utils import timezone
 
 from core import llm
+from core.logkit import fields
 from core.models import AppSetting, LlmUsage
+
+log = logging.getLogger(__name__)
 
 KIND_LABELS = dict(LlmUsage.KINDS)
 # 堆叠柱的固定顺序（颜色见 app.css 的 --k1..--k6）
@@ -370,6 +374,75 @@ def chat_recorded(kind, messages, *, pool=None, temperature=0.1, max_tokens=4096
     return ChatResult(text, usage or {}, err, False, row, tool_calls)
 
 
+# ------------------------------------------------------------------ 跨 provider 回退
+# ★ 加法式（2026-11-25）：不碰 chat_recorded —— 它被几十个调用点与测试桩钉死。
+#   本函数只在「主通道失败」时多走一次 chat_recorded（换 provider），两次各自记账，
+#   账本天然记录「agnes 失败 + deepseek 成功」两行，健康度与成本归因都不丢。
+def classify_provider_error(err: str) -> str:
+    """把 llm.chat 吞出的错误字符串归类，决定日志级别与文案。
+
+    llm.chat 不抛异常而是返回 err 字符串，形态见 llm.chat：
+      · `HTTP 401（认证失败，重试无意义）` / `HTTP 403…`
+      · `缺少 AGNES_API_KEY`
+      · `HTTPError: HTTP Error 429: Too Many Requests…`（限流）
+      · `空响应：…` / `TimeoutError: …` / `URLError: …` 等
+    ★ 401/缺 key 是**死错误**：切 provider 能救本次调用，但根因要人改 .env，故 ERROR
+      且提示配 key；429 是限流（免费通道的常态），降级是预期行为，记 INFO 即可，
+      但若反复出现说明需要调批大小/限速，保留次数供观测。
+    """
+    s = (err or "").lower()
+    if "认证失败" in (err or "") or "http 401" in s or "http 403" in s:
+        return "auth"
+    if "缺少" in (err or "") and "_api_key" in s:
+        return "missing_key"
+    if "429" in s or "too many" in s or "rate limit" in s:
+        return "rate_limit"
+    return "transient"
+
+
+def chat_recorded_with_fallback(kind, messages, *, primary="agnes",
+                                fallback="deepseek", pool=None,
+                                primary_params=None, **kwargs) -> ChatResult:
+    """先走 primary，失败则整单换 fallback 再来一次；返回**成功那次**的 ChatResult。
+
+    ★ 与 chat_recorded 完全同签名风格（kwargs 原样透传 temperature/max_tokens/
+      retries/timeout/feed_id/... 等），调用方迁移时只改函数名 + 加 primary/fallback。
+    ★ 「失败」= err 非空 或 budget_stop。budget_stop 是闸拦下（没调模型），换 provider
+      也过不了同一道闸，直接返回，不降级 —— 否则等于绕过预算闸。
+
+    ★ `primary_params` 只覆盖**主通道**那一次的同名参数（如 agnes 有兜底，把
+      retries 3→2 / timeout 90→30 缩短）；兜底通道始终用 kwargs 原值，
+      不会因为主通道的激进策略损失长任务能力。
+
+    ★ 两次调用各记各的账（都走 chat_recorded）：primary 失败行 ok=False、fallback
+      成功行 ok=True。贡献口径靠 token，不靠金额 —— 见 docs/design/llm-provider-routing.md。
+    ★ 异常不需要在这里 catch：chat_recorded → llm.chat 已把传输异常吞成 err 字符串返回
+      （铁律：llm.chat 的 except 覆盖 HTTPException/URLError/超时/JSON/空响应）。
+    """
+    first_kwargs = dict(kwargs)
+    if primary_params:
+        first_kwargs.update(primary_params)
+    first = chat_recorded(kind, messages, provider=primary, pool=pool,
+                          **first_kwargs)
+    if not first.err and not first.budget_stop:
+        return first
+    if first.budget_stop:
+        # 同一道闸，换 provider 也过不了；且闸下没调模型没记账，降级只会造一次空跑。
+        return first
+    cause = classify_provider_error(first.err)
+    extra = fields(src="llm_fallback", run=kind)
+    if cause in ("auth", "missing_key"):
+        log.error("LLM 主通道 %s 凭证失败（%s）——本次已降级 %s，但请修 .env 里的 key",
+                  primary, first.err, fallback, extra=extra)
+    elif cause == "rate_limit":
+        log.warning("LLM 主通道 %s 限流（%s）——本次降级 %s",
+                    primary, first.err, fallback, extra=extra)
+    else:
+        log.warning("LLM 主通道 %s 失败（%s）——本次降级 %s",
+                    primary, first.err, fallback, extra=extra)
+    return chat_recorded(kind, messages, provider=fallback, pool=pool, **kwargs)
+
+
 def chat_recorded_stream(kind, messages, *, pool=None, temperature=0.1,
                          max_tokens=4096, timeout=180, provider=None, model=None,
                          on_delta=None, tools=None) -> ChatResult:
@@ -627,6 +700,55 @@ def by_category(days: int = 7, cat_titles: dict = None,
                 feed_to_cat: dict = None) -> list:
     return by_category_range(last_days(days), cat_titles=cat_titles,
                              feed_to_cat=feed_to_cat)
+
+
+# ------------------------------------------------------------------ 按 provider 分流
+def by_provider_range(rng: Range) -> dict:
+    """通道分流：每个 provider 一行 + 一条「agnes 省了多少」估算结论。
+
+    ★ 贡献口径（见 docs/design/llm-provider-routing.md）：
+      · 行内 token / calls 是**直接读账本**的负载口径（诚实、可跨 provider 比）；
+      · 「省了多少」是**反事实估算**：agnes 的 token × deepseek 基准单价。不是读
+        agnes 的 cost_cny（免费期恒为 0，直接读会误读成「没贡献」）。用非高峰基准价，
+        不套 is_peak_now() —— 历史区间不该跟着「此刻是否高峰」变，且明确标「估算」。
+      · 不同 provider 的 tokenizer 不同，token 只用于占比/趋势，不做精确等值换算。
+    """
+    acc = {}
+    for r in _rows_range(rng):
+        key = (r.provider or "").strip() or "unknown"
+        b = acc.setdefault(key, _blank())
+        _acc(b, r)
+    out = []
+    for key, b in acc.items():
+        _fmt(b)
+        b["key"] = key
+        out.append(b)
+    out.sort(key=lambda x: -x["tokens"])
+    total_tokens = sum(x["tokens"] for x in out) or 1
+    for x in out:
+        x["token_pct"] = round(x["tokens"] / total_tokens * 100, 1)
+
+    # 反事实估算：agnes 的「本会花掉的钱」= (命中缓存 + 未命中 + 输出) × ds 基准价 / 1e6
+    agnes = acc.get("agnes")
+    saved = 0.0
+    if agnes:
+        pr = settings.DEEPSEEK_PRICE
+        hit = agnes.get("cached_tokens", 0)
+        miss = max(agnes.get("prompt_tokens", 0) - hit, 0)
+        out_tok = agnes.get("completion_tokens", 0)
+        saved = (hit * pr["cache_hit"] + miss * pr["cache_miss"]
+                 + out_tok * pr["output"]) / 1e6 * settings.USD_CNY
+    return {
+        "rows": out,
+        "total_tokens": total_tokens,
+        "agnes_token_pct": (acc.get("agnes") or {}).get("tokens", 0) / total_tokens * 100,
+        "saved_cny_est": round(saved, 4),
+        "has_agnes": agnes is not None,
+    }
+
+
+def by_provider(days: int = 7) -> dict:
+    return by_provider_range(last_days(days))
 
 
 # ------------------------------------------------------------------ 明细表

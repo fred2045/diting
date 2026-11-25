@@ -363,6 +363,44 @@ check("注册首跳错开半周期（避让 triage 相位）",
 
 print()
 print("=" * 68)
+print("8. agnes 短参数：有兜底就快失败，复杂任务永不入白名单")
+print("=" * 68)
+from unittest import mock  # noqa: E402
+from core import provider_route as pr  # noqa: E402
+
+_seen = []
+_fake = cr.ChatResult("[]", {}, "", False, None)
+
+
+def _fake_fallback(*a, **kw):
+    _seen.append(kw)
+    return _fake
+
+
+with mock.patch.object(pr, "resolve", return_value="agnes"), \
+     mock.patch.object(tr.cr, "chat_recorded_with_fallback",
+                       side_effect=_fake_fallback):
+    tr._call([{"id": 999999, "title": "Hello"}], feed_id=W, category_id=7)
+check("agnes 主通道 2 次 × 30s（有 ds 兜底）",
+      bool(_seen) and _seen[0].get("primary_params") == {"retries": 2, "timeout": 30},
+      _seen)
+check("兜底 deepseek 仍是 3 次 × 90s",
+      bool(_seen) and (_seen[0].get("retries"), _seen[0].get("timeout")) == (3, 90),
+      _seen)
+
+_seen.clear()
+with mock.patch.object(pr, "resolve", return_value="deepseek"), \
+     mock.patch.object(tr.cr, "chat_recorded", side_effect=_fake_fallback):
+    tr._call([{"id": 999999, "title": "Hello"}], feed_id=W, category_id=7)
+check("开关关时调用形状不变（无 primary_params，3×90s）",
+      bool(_seen) and "primary_params" not in _seen[0]
+      and (_seen[0].get("retries"), _seen[0].get("timeout")) == (3, 90), _seen)
+check("复杂任务集合与 agnes 白名单不相交",
+      not (pr.AGNES_TASKS & pr.AGNES_FORBIDDEN_TASKS),
+      sorted(pr.AGNES_TASKS & pr.AGNES_FORBIDDEN_TASKS))
+
+print()
+print("=" * 68)
 print("结果：%s 项通过，%s 项失败" % (ok, bad))
 if fails:
     print("失败：")

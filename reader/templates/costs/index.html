@@ -112,6 +112,52 @@
     </div>
   </div>
 
+  <!-- ============ 通道分流（provider） ============ -->
+  <div class="panel">
+    <div class="panel-head">
+      <b>通道分流</b>
+      <span class="meta">{{ range_label }} · token 占比按工作量算，金额是实际支出</span>
+    </div>
+    {% if providers.rows %}
+    <table class="cgrid">
+      <thead>
+        <tr>
+          <th class="w-name">通道</th>
+          <th class="num">调用</th>
+          <th class="num">输入 token</th>
+          <th class="num">输出 token</th>
+          <th class="num">token 占比</th>
+          <th class="num">实付</th>
+          <th class="num">重试/失败</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in providers.rows %}
+        <tr>
+          <td class="w-name">{{ p.key }}</td>
+          <td class="num">{{ p.calls }}</td>
+          <td class="num">{{ p.prompt_tokens|num }}</td>
+          <td class="num">{{ p.completion_tokens|num }}</td>
+          <td class="num">{{ p.token_pct|floatformat:"-1" }}%</td>
+          <td class="num">¥{{ p.cost_cny|floatformat:"-4" }}</td>
+          <td class="num">
+            {% if p.retries %}{{ p.retries }}{% else %}—{% endif %}
+            {% if p.failures %}<span class="danger">/{{ p.failures }}</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if providers.has_agnes %}
+    <div class="card-sub" style="padding:8px 12px">
+      ★ Agnès 承接了约 <b>{{ providers.agnes_token_pct|floatformat:"-1" }}%</b> 的 token；
+      若这部分全走 DeepSeek，约需 <b>¥{{ providers.saved_cny_est|floatformat:"-4" }}</b>
+      <span class="meta">（按 DeepSeek 非高峰基准价估算，仅供量级参考）</span>
+    </div>
+    {% endif %}
+    {% else %}<p class="empty">窗口内还没有记账。</p>{% endif %}
+  </div>
+
   <!-- ============ 明细表 ============ -->
   <div class="panel">
     <div class="panel-head">

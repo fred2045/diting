@@ -261,15 +261,23 @@ def chat_stream(messages, *, provider=None, model=None, temperature=0.1,
 
 
 def estimate_cost(provider: str, usage: dict):
-    """估算 (usd, cny)。只认 deepseek 的价目；其他 provider 返回 (None, None)。"""
-    if (provider or "").lower() != "deepseek":
+    """估算 (usd, cny)。只认配置内价目表（deepseek / agnes）；未知 provider 返回 (None, None)。
+
+    ★ agnes 免费期价目全 0，返回 (0.0, 0.0) 而非 (None, None)：让 cost_cny 落库为 0
+      而非 NULL，「按 provider 分组统计」才能统一走既有聚合路径。贡献口径不靠这里的
+      金额（agnes 都是 0），而靠 token 反事实估算 —— 见 docs/design/llm-provider-routing.md。
+    """
+    p = (provider or "").lower()
+    if p == "deepseek":
+        pr, k = settings.DEEPSEEK_PRICE, (2.0 if is_peak_now() else 1.0)
+    elif p == "agnes":
+        pr, k = settings.AGNES_PRICE, 1.0
+    else:
         return None, None
-    pr = settings.DEEPSEEK_PRICE
     hit = usage.get("cached_tokens", 0)
     miss = usage.get("cache_miss_tokens") or max(
         usage.get("prompt_tokens", 0) - hit, 0)
     out = usage.get("completion_tokens", 0)
-    k = 2.0 if is_peak_now() else 1.0
     usd = (hit * pr["cache_hit"] + miss * pr["cache_miss"] + out * pr["output"]) * k / 1e6
     return usd, usd * settings.USD_CNY
 

@@ -177,6 +177,11 @@ class EstimateCostTest(SimpleTestCase):
                              "completion_tokens": 100})
         self.assertAlmostEqual(usd, 100 * pr["output"] * 2 / 1e6)
 
-    def test_other_provider_unpriced(self):
-        # 非 DeepSeek 没有 cost_cny（预算靠调用次数兜底），别算出假数
-        self.assertEqual(llm.estimate_cost("agnes", self.USAGE), (None, None))
+    def test_agnes_priced_zero_not_none(self):
+        # ★ 2026-11-25 改：agnes 免费期价目全 0，但必须返回 0.0 而非 None ——
+        #   cost_cny 落库为 0 而非 NULL，「按 provider 分组统计」才能统一走聚合路径。
+        self.assertEqual(llm.estimate_cost("agnes", self.USAGE), (0.0, 0.0))
+
+    def test_unknown_provider_still_unpriced(self):
+        # 不在价目表的 provider 仍返回 None（别把配置错误伪装成免费）
+        self.assertEqual(llm.estimate_cost("bogus", self.USAGE), (None, None))

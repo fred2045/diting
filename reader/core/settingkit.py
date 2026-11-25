@@ -77,6 +77,9 @@ GROUPS = [
     Group("translate", "标题翻译", [
         Field("translate_enabled", "启用标题翻译", "bool",
               help="总开关；单个源的开关在树上右键「翻译标题」"),
+        Field("translate_prefer_agnes", "优先 Agnès 翻译", "bool",
+              help="开启后标题翻译优先走 Agnès（免费但限速），失败自动回退 DeepSeek；"
+                   "需配置 AGNES_API_KEY"),
         Field("translate_lookback_days", "回填窗口（天）", "int", "instant", 1, 30,
               help="开启一个源时回填最近 N 天的标题"),
         Field("translate_backfill_max", "回填条数上限", "int", "instant", 1, 200,

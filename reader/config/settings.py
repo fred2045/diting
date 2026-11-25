@@ -158,10 +158,14 @@ DEEPSEEK_BASE_URL = env("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstr
 DEEPSEEK_MODEL = env("DEEPSEEK_MODEL", "deepseek-chat")
 AGNES_API_KEY = env("AGNES_API_KEY", "")
 AGNES_BASE_URL = env("AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1").rstrip("/")
-AGNES_MODEL = env("AGNES_MODEL", "agnes-2.5-flash")
+AGNES_MODEL = env("AGNES_MODEL", "agnes-3.0-flash")
 
 # DeepSeek 官方价（USD / 1M tokens）；高峰时段翻倍
 DEEPSEEK_PRICE = {"cache_miss": 0.15, "cache_hit": 0.003, "output": 0.60}
+# Agnès 免费期价目：全 0 = 不花钱。★ 关键不是算它的钱，而是让 cost_cny 落库为 0
+# （不是 NULL）—— 这样「按 provider 分组统计」能统一走既有聚合路径，且将来收费时
+# 只改这张表即可（贡献口径见 docs/design/llm-provider-routing.md）。
+AGNES_PRICE = {"cache_miss": 0.0, "cache_hit": 0.0, "output": 0.0}
 USD_CNY = float(env("USD_CNY", "7.1"))
 
 # ---------------------------------------------------------------- 分级（M3）
@@ -304,6 +308,9 @@ SUMMARY_S0_MAX_TOKENS = int(env("SUMMARY_S0_MAX_TOKENS", "16000"))
 # ★ 只翻标题，不翻正文；feed 级开关默认关；独立 kind / 独立预算池。
 #   回填「最近 7 天、每 feed 最多 50 条」；后续新文章由独立 tick 自动翻。
 TRANSLATE_ENABLED = env("TRANSLATE_ENABLED", "1") == "1"
+# ★ 优先用 agnes 翻标题（免费但限速），失败自动降级 deepseek。默认 False = 零风险：
+#   不配 agnes key / 不开这个开关时，行为与迁移前完全一致（走全局 LLM_PROVIDER）。
+TRANSLATE_PREFER_AGNES = env("TRANSLATE_PREFER_AGNES", "0") == "1"
 TRANSLATE_LOOKBACK_DAYS = int(env("TRANSLATE_LOOKBACK_DAYS", "7"))
 TRANSLATE_BACKFILL_MAX = int(env("TRANSLATE_BACKFILL_MAX", "50"))   # 每 feed 回填上限 N
 TRANSLATE_PER_TICK_MAX = int(env("TRANSLATE_PER_TICK_MAX", "20"))   # 每 feed 每 tick 增量上限

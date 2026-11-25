@@ -30,7 +30,7 @@ from django.utils import timezone
 from django.utils.html import strip_tags
 
 from core import costreport as cr
-from core import jsontool, llm, settingkit as sk
+from core import jsontool, llm, provider_route, settingkit as sk
 from core.datasource import new_datasource
 from core.jobstate import JobState
 from core.logkit import fields
@@ -209,13 +209,28 @@ def _call(items, *, feed_id, category_id, entry_id=None):
         json.dumps(x, ensure_ascii=False) for x in payload) + "\n</titles>"
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user}]
+    kw = dict(temperature=0, max_tokens=settings.TRANSLATE_MAX_TOKENS,
+              retries=3, timeout=90,
+              feed_id=feed_id, category_id=category_id, entry_id=entry_id)
     try:
-        res = cr.chat_recorded(
-            "translate_title", messages,
-            temperature=0, max_tokens=settings.TRANSLATE_MAX_TOKENS,
-            retries=3, timeout=90,
-            feed_id=feed_id, category_id=category_id, entry_id=entry_id)
-        return res.text, res.usage, res.err, llm.provider_cfg()
+        # ★ 路由（2026-11-25）：开关关 → 完全保持现状（不传 provider，走全局
+        #   LLM_PROVIDER）；开关开且有 key → agnes，失败自动降级 deepseek。
+        #   绝不改开关关时的行为，这条路径被几十个测试桩钉死。
+        # ★ agnes 有兜底，走短参数（2 次 × 30s）；deepseek 兜底仍 3 次 × 90s。
+        provider = provider_route.resolve("translate")
+        if provider == "agnes":
+            res = cr.chat_recorded_with_fallback(
+                "translate_title", messages, primary="agnes",
+                fallback="deepseek",
+                primary_params=provider_route.call_params("translate", provider),
+                **kw)
+            # ★ model 写实际落账的 provider（fallback 后可能是 deepseek 而非 agnes）。
+            #   usage_row 是账本真相；桩里 record 返回 None 时退回按 agnes 记。
+            used = getattr(res.usage_row, "provider", None) or "agnes"
+        else:
+            res = cr.chat_recorded("translate_title", messages, **kw)
+            used = None   # 现状：不传 provider → cfg 走全局
+        return res.text, res.usage, res.err, llm.provider_cfg(used)
     except Exception as exc:  # noqa: BLE001  兜底：任何异常都不能把 worker 打死
         return "", {}, f"{type(exc).__name__}: {exc}", llm.provider_cfg()
 
