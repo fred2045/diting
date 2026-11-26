@@ -42,3 +42,5 @@ docs/design/
 
 # 对外投稿 / 推广稿（本地草稿，不入库）
 docs/pr/
+
+.workbuddy/

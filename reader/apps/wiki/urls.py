@@ -15,6 +15,8 @@ urlpatterns = [
     #   页相对路径里有 `<domain>/`，做成 <path:rel> 会和 /wiki/approve 这类端点
     #   抢前缀；而且 core.resolve_page() 本来就要对整串做「留在 wiki/ 之下」的校验。
     path("wiki/page", views.page, name="wiki_page"),
+    # 单页版本历史（2026-11-26）：读该页在 wiki git 仓库里的提交记录，只读。
+    path("wiki/page/history", views.page_history, name="wiki_page_history"),
     # 审批 / 退稿只接受 POST（GET 会改文件 = 能被预取或被预览链接误触发）
     path("wiki/approve", views.approve, name="wiki_approve"),
     path("wiki/discard", views.discard, name="wiki_discard"),

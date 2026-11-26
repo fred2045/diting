@@ -373,6 +373,11 @@ SUMMARY_CACHE_DIR = PROJECT_ROOT / "data" / "cache" / "summary"
 # 即可（嵌套仓库不受父仓库 ignore 影响）。可用 WIKI_DIR 指到 Obsidian vault。
 WIKI_DIR = Path(env("WIKI_DIR", str(PROJECT_ROOT / "data" / "wiki")))
 
+# ★ 版本快照开关（2026-11-26）：入库 / 编辑落盘后，在 wiki 目录里自动 git commit。
+#   默认关（版本化是「锦上添花」，git 不可用 / 未 init 时静默降级不报错）。
+#   开启前先在 wiki 目录 `git init`（可单独推远端做备份/同步，见 docs/wiki.md）。
+WIKI_GIT_ENABLED = env("WIKI_GIT_ENABLED", "0") == "1"
+
 # ★ 知识库独立预算池（第 5 池，2026-10-31）。wiki 的编译/对话/提取/lint 全是
 #   **事件驱动**的开销（人什么时候用什么时候花），与日报/周报的定时批处理节奏完全不同：
 #   混进总结池会重演「补跑报告把分级饿死」那一幕（只是方向反过来 —— 聊两句就吃掉当天日报的钱）。

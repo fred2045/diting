@@ -1542,6 +1542,7 @@ a.tag-more:hover { color: var(--text); }
 .diff-ins { display: block; background: #eaf6ee; color: #1a5d2a; }
 .diff-eq  { display: block; color: var(--fg-dim); }
 .diff-gap { display: block; color: var(--fg-dim); font-style: italic; }
+.diff-meta { display: block; color: var(--fg-dim); font-size: 11px; opacity: .8; }
 .diff-del::before { content: "− "; }
 .diff-ins::before { content: "+ "; }
 

@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+
+{% block title %}{% if pg %}{{ pg.title }} 的版本历史{% else %}版本历史{% endif %} · 知识库{% endblock %}
+
+{% block content %}
+<div class="page">
+  <div class="page-head">
+    <h2>{% if pg %}{{ pg.title }} · 版本历史{% else %}版本历史{% endif %}</h2>
+    <div class="page-actions">
+      <a class="btn" href="/wiki">回知识库</a>
+      {% if pg %}<a class="btn" href="/wiki/page?p={{ pg.page|urlencode }}">回本页</a>{% endif %}
+    </div>
+  </div>
+
+  {% if not pg %}
+  <div class="alert-bar">
+    读不到这一页：<code>{{ asked }}</code>。可能已被删 / 改名，或路径跑出了 <code>wiki/</code>。
+  </div>
+  {% else %}
+  <p class="meta">
+    这一页在 wiki git 仓库里的提交记录（最新在前）。点 <code>hash</code> 看当次改动；
+    终端里 <code>git checkout &lt;hash&gt; -- {{ pg.page }}</code> 可回滚到某个版本。
+  </p>
+
+  {% if not entries %}
+  <div class="panel">
+    <div class="empty">
+      {% if git_ready %}
+      这一页还没有任何提交记录 —— 开启版本快照（<code>WIKI_GIT_ENABLED=1</code>）后，
+      下一次审批入库 / 编辑才会打上第一个版本。
+      {% else %}
+      wiki 目录还不是 git 仓库（没有 <code>.git</code>），所以没有版本历史。
+      想启用版本：<code>cd data/wiki && git init</code>，再在 <code>.env</code> 里开
+      <code>WIKI_GIT_ENABLED=1</code>。
+      {% endif %}
+    </div>
+  </div>
+  {% else %}
+  <div class="panel">
+    <table class="cgrid">
+      <thead>
+        <tr><th class="w-name">hash</th><th>日期</th><th>提交说明</th></tr>
+      </thead>
+      <tbody>
+        {% for e in entries %}
+        <tr>
+          <td>
+            <a href="/wiki/page/history?p={{ pg.page|urlencode }}&amp;diff={{ e.hash }}"
+               title="看这次改动">{{ e.short }}</a>
+          </td>
+          <td>{{ e.date }}</td>
+          <td>{{ e.subject }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if diff_view %}
+  {% with r=diff_view.result %}
+  <div class="panel" style="margin-top:14px;">
+    <div class="panel-head">
+      {% if diff_view.mode == "single" %}
+      <b>{{ diff_view.head_short }} 的改动</b>
+      <span class="meta">{% if diff_view.base %}相对 {{ diff_view.subject }}{% else %}这一页首次出现（相对空版本）{% endif %}</span>
+      {% else %}
+      <b>对比 {{ diff_view.base|default:"空版本" }} → {{ diff_view.head|default:"当前" }}</b>
+      {% endif %}
+    </div>
+
+    {% if not r.ok %}
+    <div class="alert-bar">读不到这次 diff（git 不可用或参数对不上）。</div>
+    {% elif not r.rows %}
+    <div class="empty">这两个版本之间这一页没有变化。</div>
+    {% else %}
+    <p class="meta">
+      {% if r.deleted %}这一页在该次提交里被<b>删除</b>（下方是删除前的内容）。{% endif %}
+      {% if r.files > 1 %}该次提交同时动了 {{ r.files }} 个文件（这里只显示本页）。{% endif %}
+      改动 <b>−{{ r.n_del }} / +{{ r.n_ins }}</b>
+      {% if r.truncated %} · 太长，已截断，看全文请去终端 <code>git show {{ diff_view.head }}</code>{% endif %}
+    </p>
+    <pre class="diff">{% for x in r.rows %}<span class="diff-{{ x.kind }}">{{ x.text|default:" " }}</span>
+{% endfor %}</pre>
+    {% endif %}
+  </div>
+  {% endwith %}
+  {% endif %}
+  {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

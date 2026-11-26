@@ -39,6 +39,8 @@
     域 <b>{{ pg.domain|default:"—" }}</b> · 更新 <b>{{ pg.updated|default:"—" }}</b> ·
     置信 <span class="tag conf-{{ pg.confidence }}">{{ pg.confidence|default:"—" }}</span> ·
     {{ pg.chars }} 字 · <code>{{ pg.page }}</code>
+    {% if git_ready %}<a class="meta" href="{% url 'wiki_page_history' %}?p={{ pg.page|urlencode }}"
+       title="这一页在 git 里的提交记录">版本历史</a>{% endif %}
     {% comment %}
     ★ 标签（2026-11-16）：来自 frontmatter 的 tags，编译时模型建议、审批对话
       可改。**可点** —— 点一下跳到 `/wiki?tag=` 看同标签的其它页，这是标签

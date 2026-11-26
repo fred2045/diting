@@ -320,7 +320,8 @@ def page(request):
     pg = wstore.read_page(rel) if rel else None
     # ★ 第十一步：详情页的「拉入审批编辑 / 提交删除请求」也是编辑动作，
     #   编译一条龙进行中要可见地灰掉（与服务端守卫同一句人话）。
-    ctx = {"pg": pg, "asked": rel, "mutex_msg": _compile_running_guard()}
+    ctx = {"pg": pg, "asked": rel, "mutex_msg": _compile_running_guard(),
+           "git_ready": wstore.git_available()}
     if pg:
         # 反向映射在人眼里的样子：这一页引用的每个来源，另外还牵着哪些页。
         # 来源变了（文章更新 / 对话续上）→ 从任一端都能找到要复查的页。
@@ -361,6 +362,59 @@ def page(request):
             "fm_rows": [(k, v) for k, v in pg["fm"].items()],
         })
     return render(request, "wiki/page.html", ctx, status=200 if pg else 404)
+
+
+def page_history(request):
+    """单页版本历史：读该页在 wiki git 仓库里的提交记录；支持点开看单次 diff。
+
+    ★ 只读、零 LLM、零写盘；git 不可用 / 页从未提交时给「没有版本」的可见说明，
+      绝不报 500 —— 版本入口是锦上添花，不该让一个查询失败拖垮详情页体验。
+    ★ 与 page() 同一套 p= 语义：传页相对路径（wiki/<domain>/<slug>.md）。
+    ★ 三种 diff 形态（都走同一个页面）：
+      1. 无 diff 参数      → 只列历史，每条 hash 可点；
+      2. ?diff=<hash>      → 看该次提交相对父提交的改动（第一条历史则相对空树）；
+      3. ?from=<a>&to=<b>  → 任选两个版本对比（from/to 之一可为空 = 空树/HEAD）。
+    """
+    rel = (request.GET.get("p") or "").strip()
+    pg = wstore.read_page(rel) if rel else None
+    entries = wstore.page_history(rel) if rel else []
+    # diff 模式：单次（diff=hash）或区间（from/to）。两者都拼进 ctx 交给模板。
+    diff = (request.GET.get("diff") or "").strip()
+    frm = (request.GET.get("from") or "").strip()
+    to = (request.GET.get("to") or "").strip()
+    diff_view = None
+    if diff:
+        # 单次 diff：找该 hash 在历史里的位置，base 取它的前一条（父提交）。
+        # 若它是最后一条（最老的、第一条），父提交用空树 → 展示「文件最初长这样」。
+        # ★ 兼容短 hash：模板里的链接给的是完整 hash，但人也可能手敲短 hash，
+        #   用 startswith 前缀匹配（git 本身也接受短 hash）。
+        idx = next((i for i, e in enumerate(entries)
+                    if e["hash"] == diff or e["hash"].startswith(diff)), None)
+        if idx is not None:
+            parent = entries[idx + 1]["hash"] if idx + 1 < len(entries) else ""
+            diff_view = {
+                "mode": "single",
+                "base": parent,
+                "head": diff,
+                "head_short": entries[idx]["short"],
+                "subject": entries[idx]["subject"],
+                "result": wstore.page_diff(rel, parent, diff),
+            }
+    elif frm or to:
+        diff_view = {
+            "mode": "range",
+            "base": frm,
+            "head": to,
+            "result": wstore.page_diff(rel, frm, to),
+        }
+    ctx = {
+        "pg": pg,
+        "asked": rel,
+        "entries": entries,
+        "git_ready": wstore.git_available(),
+        "diff_view": diff_view,
+    }
+    return render(request, "wiki/page_history.html", ctx)
 
 
 def _fragment(request, **kw) -> HttpResponse:

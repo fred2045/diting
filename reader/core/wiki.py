@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -1809,6 +1810,14 @@ def commit() -> tuple:
     # ⑨ 批末断链处置放在 commit 记完之后：日志顺序是「入库 → 补链」，且补链稿
     #    属于**下一轮**审批，不该混进本轮 `_archive_commit` 的批次边界。
     relink = relink_after_commit(new_broken, deleted)
+    # ★ 版本快照：整批落盘完成后的可回滚点。补链稿是**下一轮**的草稿，不该混进
+    #   本次提交（它在 .drafts/ 里，而 .gitignore 已挡掉 .drafts/，天然分开）。
+    _git_commit(
+        f"commit: {n_all} 页入库"
+        f"（新 {len(committed)}" + (f" · 合并 {len(merged)}" if merged else "")
+        + (f" · 编辑 {len(edited)}" if edited else "")
+        + (f" · 删除 {len(deleted)}" if deleted else "") + "）"
+    )
     return True, {
         "committed": committed,
         "merged": merged,
@@ -2102,6 +2111,7 @@ def save_page(page_rel: str, body: str) -> tuple:
 
     log_append("edit-page", page_rel, f"{len(body)} 字")
     rebuild_sources_index(mark_log=False)
+    _git_commit(f"edit: {page_rel}")
     return True, {"chars": len(body), "page": page_rel}
 
 
@@ -2196,6 +2206,185 @@ def log_append(action: str, target: str, note: str = "") -> None:
         block += f"- {note}\n"
     with p.open("a", encoding="utf-8") as fh:
         fh.write(block)
+
+
+# ------------------------------------------------------------------ git 版本快照
+def _git_commit(message: str) -> bool:
+    """入库 / 编辑落盘后，在 wiki 目录里打一次 git commit（自动版本快照）。
+
+    返回是否真正提交成功（失败只记日志，**绝不抛**——版本化是「锦上添花」，
+    不能因为 git 不可用 / 未 init / 在别的机器上没装 git，就把入库动作拖垮）。
+
+    ★ 为什么挂在这里而不是 `log_append`：log_append 每次审批会被调多次（approve /
+      merge / edit / delete 各记一条），挂在那会一个批次打十几个碎 commit；
+      版本快照的语义是「一次落盘 = 一个可回滚点」，所以挂在 commit() 和 save_page()
+      这两个**物理写盘收口**处，各打一个。
+    ★ 静默降级的三类情形（都算「没这个能力」，不打扰人）：
+      1. 开关关闭（WIKI_GIT_ENABLED != 1）—— 默认关，人主动开才启用；
+      2. 目录不是 git 仓库（没 `git init` 过）；
+      3. git 命令失败（没装 / 没配 user / 仓库损坏）。
+    """
+    if not getattr(settings, "WIKI_GIT_ENABLED", False):
+        return False
+    r = root()
+    if not (r / ".git").exists():
+        return False
+    try:
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=str(r), check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", message],
+            cwd=str(r), check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return True
+    except (OSError, subprocess.CalledProcessError) as exc:
+        # 没装 git / 没配 user.name / 没有变更（nothing to commit）都会落到这。
+        # 有变更才算异常值得记；「nothing to commit」是正常幂等，忽略即可。
+        log.info("wiki git 版本快照跳过：%s", exc)
+        return False
+
+
+def git_available() -> bool:
+    """git 版本能力是否「生效」——版本历史入口 / 历史页是否该露面的唯一判据。
+
+    ★ 判据 = 开关开启 AND 目录是 git 仓库。两者缺一就不是「开启版本化」的状态：
+      - 开关关着：即便目录里有个 .git（手动管理过），也视为「没开这个能力」，
+        不显示入口——用户关掉开关就是想让版本化退场，不该再露入口。
+      - 目录没 .git：开关开了但没 init，`page_history` 只会返回空，入口是死链。
+    ★ 与 `_git_commit` / `page_history` 共用同一判据，避免「能写不能读 / 能读
+      不能写」的口径分裂。
+    """
+    if not getattr(settings, "WIKI_GIT_ENABLED", False):
+        return False
+    return (root() / ".git").exists()
+
+
+def page_history(page_rel: str, limit: int = 20) -> list:
+    """读某页的 git 提交历史（最新在前），供详情页「版本」入口展示。
+
+    返回条目列表，每条 `{hash, short, date, subject}`；git 不可用 / 仓库不存在 /
+    该页从未被提交时返回空列表（读历史是纯查询，失败**静默降级**成「没有版本」，
+    不抛——版本入口本来就是锦上添花，不能因为没 git 就让详情页报错）。
+    """
+    r = root()
+    if not (r / ".git").exists():
+        return []
+    # 页相对路径（如 wiki/ai/xxx.md）可能被传入整串或带前导斜杠，统一剥干净。
+    rel = (page_rel or "").strip().replace("\\", "/").lstrip("/")
+    if not rel:
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "log", "--follow", "--format=%H%x1f%h%x1f%ad%x1f%s",
+             "--date=short", "-n", str(limit), "--", rel],
+            cwd=str(r), check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return []
+    if proc.returncode != 0:
+        return []
+    out = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split("\x1f")
+        if len(parts) < 4:
+            continue
+        out.append({
+            "hash": parts[0],
+            "short": parts[1],
+            "date": parts[2],
+            "subject": parts[3],
+        })
+    return out
+
+
+def page_diff(page_rel: str, base: str = "", head: str = "") -> dict:
+    """读某页在两个版本之间的 diff，供版本历史页点开看「这次改了什么」。
+
+    参数：
+      page_rel  页相对路径（wiki/<domain>/<slug>.md）
+      base      diff 的旧端（commit hash；为空 = 该文件首次出现前的「空树」）
+      head      diff 的新端（commit hash；为空 = 当前工作区 HEAD）
+
+    返回 `{ok, rows, files, deleted, truncated, n_del, n_ins}`：
+      ok        是否成功拿到 diff（git 不可用 / 仓库不存在 / 参数非法 = False）
+      rows      `[{"kind": "eq"|"del"|"ins"|"gap"|"meta", "text": ...}]`，
+                与 `body_diff` 同一套结构，模板复用 `.diff-*` 上色；
+                `meta` 是 diff 的元信息行（diff --git / index / --- / +++ 等）。
+      files     这次改动涉及的文件数（对单页通常就是 1）
+      deleted   该次提交里这个文件是否被删除（diff 是「整页删除」）
+      truncated 超过阈值被截断（前端给「太长，去终端看」的提示）
+      n_del/n_ins 删除/新增行数（不含 meta），供「−N / +M」摘要
+
+    ★ 只读、零 LLM、零写盘，与 page_history 同一套静默降级——失败返回 ok=False，
+      绝不抛，由模板渲染成「读不到这次 diff」的可见说明。
+    ★ base 为空的语义：用户点了「第一条历史」想看看这个文件最初长什么样。
+      用 git 的空树对象 4b825dc642cb6eb9a060e54bf8d69288fbee4904 当 base，就能
+      让 `git diff <空树> <head> -- file` 输出「整文件新增」的 diff。
+    ★ 为什么把 unified diff 拆成结构化行而不是留整段文本：审批工作区的「看改动」
+      已经用 `body_diff` 产出 `{kind, text}` 且模板有 `.diff-del/.diff-ins/...`
+      一整套上色，这里对齐同一种结构，版本历史的 diff 和审批 diff 长得一致。
+    """
+    empty = {"ok": False, "rows": [], "files": 0, "deleted": False,
+             "truncated": False, "n_del": 0, "n_ins": 0}
+    r = root()
+    if not (r / ".git").exists():
+        return empty
+    rel = (page_rel or "").strip().replace("\\", "/").lstrip("/")
+    if not rel:
+        return empty
+    # 空树对象哈希：git 内建的「什么都没有」树，用于 diff 出文件的第一个版本。
+    empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    base_arg = base.strip() or empty_tree
+    head_arg = head.strip() or "HEAD"
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--no-color", "-M", base_arg, head_arg, "--", rel],
+            cwd=str(r), check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return empty
+    if proc.returncode != 0:
+        return empty
+    text = proc.stdout.decode("utf-8", "replace")
+    if not text.strip():
+        # diff 为空 = 两个版本间这一页没变化（或路径没对上），算「成功但无内容」。
+        return {"ok": True, "rows": [], "files": 0, "deleted": False,
+                "truncated": False, "n_del": 0, "n_ins": 0}
+    lines = text.splitlines()
+    files = len([l for l in lines if l.startswith("diff --git ")])
+    deleted = any(l.startswith("deleted file mode") for l in lines)
+    # 超长截断（单页几千行 diff 时，详情页里没必要全量塞给浏览器）。
+    max_lines = 400
+    truncated = len(lines) > max_lines
+    if truncated:
+        lines = lines[:max_lines]
+    # 把 unified diff 的行转成 {kind, text}。unified 前缀语义：
+    #   '+' 新增  /  '-' 删除  /  ' ' 上下文  /  '@@' hunk 头  / 其他是元信息。
+    rows = []
+    for ln in lines:
+        if ln.startswith("+++") or ln.startswith("---") or ln.startswith("diff --git") \
+                or ln.startswith("index ") or ln.startswith("new file mode") \
+                or ln.startswith("deleted file mode") or ln.startswith("similarity index") \
+                or ln.startswith("rename from") or ln.startswith("rename to"):
+            rows.append({"kind": "meta", "text": ln})
+        elif ln.startswith("@@"):
+            rows.append({"kind": "gap", "text": ln})
+        elif ln.startswith("+"):
+            rows.append({"kind": "ins", "text": ln[1:]})
+        elif ln.startswith("-"):
+            rows.append({"kind": "del", "text": ln[1:]})
+        else:
+            rows.append({"kind": "eq", "text": ln[1:] if ln.startswith(" ") else ln})
+    n_del = sum(1 for x in rows if x["kind"] == "del")
+    n_ins = sum(1 for x in rows if x["kind"] == "ins")
+    return {"ok": True, "rows": rows, "files": files, "deleted": deleted,
+            "truncated": truncated, "n_del": n_del, "n_ins": n_ins}
 
 
 def read_log(limit: int = 50) -> list:

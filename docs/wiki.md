@@ -59,7 +59,22 @@
 
 入库页落盘为 `wiki/<领域>/<slug>.md`，附 `index.md`、`log.md`、`meta/`、
 `sources.json`（页面 → 来源反向映射）。默认在 `data/wiki/`，`.env` 的 `WIKI_DIR`
-可直接指向你的 Obsidian vault。
+可直接指向你的 Obsidian vault（vault 打开的是 `data/wiki` 这一层，`index.md`
+的链接以它作根）。
+
+**版本快照（可选）**：`WIKI_GIT_ENABLED=1` 时，每次审批入库 / 编辑页面落盘后
+会在 `data/wiki/` 里自动打一次 git commit（`git add -A && git commit`）。目录里
+已内置 `.gitignore`，只版本化页面、挡掉 `log.md`/`meta/`/`.drafts/` 等运行态产物；
+git 不可用或目录没 `git init` 时静默降级、不影响入库。要回滚某页：`cd data/wiki`
+后 `git log` 看历史、`git checkout <hash> -- wiki/<页>.md`；要备份/多设备同步，
+把它当一个普通 git 仓库 `git remote add` 再 `push` 即可。
+
+**版本历史入口**：单页详情顶部 meta 行的「版本历史」链接（`/wiki/page/history?p=…`）
+列出该页的每次提交（hash / 日期 / 说明），点进去看这页以前长什么样、按说明回滚。
+点某条 `hash` 直接看**当次 diff**（新增/删除行上色，摘要 `−N / +M`）；第一条历史
+显示「整页最初长这样」。它只读 git 历史、不把历史写进页面，所以页面仍是干净可被
+Obsidian 接管的纯 Markdown。**入口只在版本化能力生效时显示**（`WIKI_GIT_ENABLED=1`
+且目录已 `git init`）；没开这个能力时详情页不露「版本历史」链接。
 
 浏览入口：`/wiki`（按标签 / 来源筛选）、`/wiki/tags`（全库词表）、
 `/wiki/page?p=…`（单页详情）。
@@ -88,6 +103,7 @@
 | 键                         | 默认        | 说明                                           |
 | -------------------------- | ----------- | ---------------------------------------------- |
 | `WIKI_DIR`                 | `data/wiki` | 落盘根目录，可指向 Obsidian vault              |
+| `WIKI_GIT_ENABLED`         | `0`         | 入库/编辑后自动 git commit（需先 `git init`）   |
 | `WIKI_BUDGET_CNY`          | `0.5`       | 知识库池日上限（¥）                            |
 | `WIKI_CHAT_ENABLED`        | `1`         | 问 AI 对话开关                                 |
 | `WIKI_CHAT_ARTICLE_CHARS`  | `6000`      | 正文进 prompt 的字数上限（每轮重发，越大越贵） |
