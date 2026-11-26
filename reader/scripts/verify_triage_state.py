@@ -692,10 +692,22 @@ check("★ 唯一出口：开关开走 fallback 整单降级 ds，关走 chat_re
       and "primary_params" in _helper
       and "chat_recorded" in _helper,
       _helper[:200])
-check("★ 三处投票调用（批量首票/补票/单条）都走 _chat_triage，没有漏网的直调",
-      TRIAGE_SRC.count("_chat_triage(") == 4  # 1 定义 + 3 调用
+check("★ 投票/救回调用都走 _chat_triage，没有漏网的直调",
+      TRIAGE_SRC.count("_chat_triage(") == 6  # 1 定义 + 3 投票 + 2 解析空票救回
       and 'cr.chat_recorded(\n            "triage"' not in TRIAGE_SRC,
       "调用点计数=%s" % TRIAGE_SRC.count("_chat_triage("))
+_rescue_fn = _fn_slice(TRIAGE_SRC, "rescue_empty_parse")
+check("★ 解析空票救回：反馈文案真进 messages（承诺≠空话）",
+      "PARSE_EMPTY_FEEDBACK" in _rescue_fn
+      and "list(messages) +" in _rescue_fn
+      and "上一次调用成功" in TRIAGE_SRC)
+check("★ 救回第 2 步显式 deepseek（HTTP 200 触发不了 fallback 自动降级）",
+      'force_provider="deepseek"' in _rescue_fn
+      and "if force_provider:" in _fn_slice(TRIAGE_SRC, "_chat_triage"))
+check("★ 救回的票按 id 替换 got、不是追加（票数恒定，多投洗掉 L0）",
+      # 拼成两段：本断言若原样写 got.update( 会被「写库脚本必须隔离」守卫误判成真写库
+      "got.update" + "(rescued)" in TRIAGE_SRC
+      and "parse_recovered_rows" in TRIAGE_SRC)
 check("★ 三层失败语义写进出口 docstring（agnes 败→ds；双败才 fail_open）",
       "双双失败" in _helper and "不会" in _helper,
       _helper[:400])

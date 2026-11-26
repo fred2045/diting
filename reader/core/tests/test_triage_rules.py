@@ -9,6 +9,7 @@
 全部纯函数，不碰库、不调模型。
 """
 from datetime import timedelta
+from unittest import mock
 
 from django.conf import settings
 from django.test import SimpleTestCase
@@ -176,3 +177,81 @@ class RateStateTest(SimpleTestCase):
         self.assertEqual(out["fail"], 1)
         for state in triage.RATE_STATES:
             self.assertIn(state, out)
+
+
+class RescueEmptyParseTest(SimpleTestCase):
+    """★ 解析空票救回（方案1）：反馈重试 1 次 → ds 1 次 → 仍空交调用方 fail_open。
+
+    纯桩测试：只验证「调了几次 / 用了什么 provider / 反馈进没进 messages / 票数
+    与预算怎么记」，不碰库不调模型。
+    """
+    ROW = '[{"id":7,"level":2,"why":"救回的票"}]'
+
+    def _stats(self, calls=0, max_calls=10):
+        return {"llm_calls": calls, "parse_empty": 1, "parse_recovered": 0,
+                "parse_recovered_rows": 0, "budget_stop": False, "errors": []}
+
+    def _call(self, stats, max_calls=10):
+        return triage.rescue_empty_parse(
+            [{"role": "user", "content": "原始 prompt"}],
+            feed_id=3, category_id=None, temperature=0.1, timeout=90,
+            stats=stats, max_calls=max_calls)
+
+    def test_feedback_retry_success_stops_before_ds(self):
+        st = self._stats()
+        fake = triage_cost = SimpleResult(self.ROW)
+        with mock.patch.object(triage, "_chat_triage", return_value=fake) as m:
+            got = self._call(st)
+        self.assertEqual(m.call_count, 1, "反馈重试救回就不该再花 ds 的钱")
+        msgs = m.call_args.args[0]
+        self.assertIn(triage.PARSE_EMPTY_FEEDBACK, msgs[-1]["content"])
+        self.assertEqual(got[7]["level"], 2)
+        self.assertEqual(st["llm_calls"], 1)
+
+    def test_feedback_empty_then_ds_success(self):
+        st = self._stats()
+        seq = [SimpleResult("解释文字但没有 JSON"), SimpleResult(self.ROW)]
+        with mock.patch.object(triage, "_chat_triage", side_effect=seq) as m:
+            got = self._call(st)
+        self.assertEqual(m.call_count, 2)
+        self.assertEqual(m.call_args.kwargs.get("force_provider"), "deepseek",
+                         "第 2 步必须显式 ds（HTTP 200 触发不了 fallback）")
+        self.assertEqual(got[7]["level"], 2)
+        self.assertEqual(st["llm_calls"], 2)
+
+    def test_both_empty_returns_nothing_for_caller_fail_open(self):
+        st = self._stats()
+        with mock.patch.object(triage, "_chat_triage",
+                               return_value=SimpleResult("仍然没有票")) as m:
+            got = self._call(st)
+        self.assertEqual(m.call_count, 2)
+        self.assertEqual(got, {})
+        self.assertEqual(st["llm_calls"], 2)
+
+    def test_max_calls_stops_immediately(self):
+        st = self._stats(calls=10)
+        with mock.patch.object(triage, "_chat_triage") as m:
+            got = self._call(st, max_calls=10)
+        self.assertEqual(m.call_count, 0, "闸满时一步都不许调用")
+        self.assertEqual(got, {})
+
+    def test_budget_stop_propagates(self):
+        st = self._stats()
+        with mock.patch.object(triage, "_chat_triage",
+                               return_value=SimpleResult("", budget_stop=True)):
+            got = self._call(st)
+        self.assertEqual(got, {})
+        self.assertTrue(st["budget_stop"])
+
+    def test_call_error_not_parsed_as_recovery(self):
+        st = self._stats()
+        with mock.patch.object(triage, "_chat_triage",
+                               return_value=SimpleResult("", err="HTTP 429")) as m:
+            got = self._call(st)
+        self.assertEqual(got, {})
+
+
+class SimpleResult:
+    """最小 ChatResult 替身：救回函数只读 .text/.err/.budget_stop。"""
+    def __init__(self, text, err="", budget_stop=False):
+        self.text, self.err, self.budget_stop = text, err, budget_stop

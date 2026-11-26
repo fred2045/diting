@@ -38,8 +38,14 @@ MIN_VOTES_FOR_L0 = 2
 
 
 def _chat_triage(messages, *, temperature, max_tokens, retries, timeout,
-                 feed_id, category_id):
+                 feed_id, category_id, force_provider=None):
     """分级唯一的 LLM 调用出口：开关开 → agnes 优先、整单降级 deepseek；关 → 原样。
+
+    ★ `force_provider`（2026-11-26，解析空票救回专用）：非空时**绕过路由**，直接
+      用指定 provider 走一次（仍由 chat_recorded 记账/过闸）。
+      解析空票是 HTTP 200 / err 空，触发不了 `chat_recorded_with_fallback` 的降级
+      （它只在 err 非空时换 ds），救回第 2 次要 ds 只能显式指定。默认 None 时
+      签名与行为对现有全部调用点一字不变。
 
     ★ 每票各调一次本函数（批量首票 / 批量补票 / 单条判定），故「前两票 agnes 成功、
       第三票 agnes 失败自动转 ds」天然成立 —— 第三票由
@@ -55,6 +61,8 @@ def _chat_triage(messages, *, temperature, max_tokens, retries, timeout,
     kw = dict(pool=cr.POOL_TRIAGE, temperature=temperature, max_tokens=max_tokens,
               retries=retries, timeout=timeout,
               feed_id=feed_id, category_id=category_id)
+    if force_provider:
+        return cr.chat_recorded("triage", messages, provider=force_provider, **kw)
     if provider_route.resolve("triage") == "agnes":
         return cr.chat_recorded_with_fallback(
             "triage", messages, primary="agnes", fallback="deepseek",
@@ -359,6 +367,63 @@ def parse_rows(text):
     return rows
 
 
+# ------------------------------------------------------------------ 解析空票救回
+#: ★ 解析空票的反馈文案（2026-11-26）：调用成功却零票时，把「上次输出解析不出票」
+#:   这个具体原因回喂模型再试一次，而不是原样重问（对照实验证明原 prompt 能出票，
+#:   但失败那次的输出形态异常；带反馈才能收敛）。措辞照搬结论文重编的
+#:   `POLISH_FEEDBACK` 思路 —— 提示词里写「只输出 JSON」是承诺，程序事实是反馈
+#:   真的进了 messages（见下面 `rescue_empty_parse`）。
+PARSE_EMPTY_FEEDBACK = (
+    "上一次调用成功，但输出无法解析出任何有效票。请严格只输出一个 JSON 数组，"
+    "格式 [{\"id\": 条目编号, \"level\": 0|1|2|3, \"one_line\": \"一句话\", \"why\": \"理由\"}]，"
+    "不要任何解释文字或 Markdown 代码围栏。"
+)
+# 救回固定两步：带反馈重试 1 次 → 仍空显式 ds 1 次；仍空才 fail_open。
+# 不设「次数常量」——两步语义不同（前者换提示词、后者换 provider），
+# 塞进一个整数反而会被误读成可以叠次数（叠次数只会烧钱，见方案讨论）。
+
+
+def rescue_empty_parse(messages, *, feed_id, category_id, temperature, timeout,
+                       stats, max_calls):
+    """整批零票救回：带反馈重试 1 次 → 仍空显式 ds 1 次。返回 `{id: vote}`。
+
+    ★ 只救「调用成功但零票」（silent_empty）：err 非空是真调用失败，agnes→ds
+      已在 `_chat_triage` 里降级过，不在这里重复花钱。
+    ★ 每一步都过闸：撞 `max_calls` 或 `budget_stop` 立即停、把已拿到的票交回；
+      调用计数由本函数统一累加（`stats["llm_calls"]`），调用方不要再记。
+    ★ 票数恒定：返回的票按 id **替换** `got` 里的同名票，不追加（多投会把 L0
+      洗成非 L0，见 `_chat_triage` docstring）。
+    """
+    recovered = {}
+    # 第 1 步：带反馈重试（沿用分级出口的路由 / 降级语义）
+    if stats["llm_calls"] < max_calls:
+        retry = list(messages) + [{"role": "user", "content": PARSE_EMPTY_FEEDBACK}]
+        res = _chat_triage(retry, temperature=temperature, max_tokens=4096,
+                           retries=2, timeout=timeout,
+                           feed_id=feed_id, category_id=category_id)
+        if res.budget_stop:
+            stats["budget_stop"] = True
+            return recovered
+        stats["llm_calls"] += 1
+        if not res.err:
+            recovered = {r["id"]: r for r in parse_rows(res.text)}
+    if recovered:
+        return recovered
+    # 第 2 步：仍零票 → 显式 ds 一次（HTTP 200 触发不了 fallback 的自动降级）
+    if stats["llm_calls"] < max_calls:
+        res_ds = _chat_triage(messages, temperature=temperature, max_tokens=4096,
+                              retries=2, timeout=timeout,
+                              feed_id=feed_id, category_id=category_id,
+                              force_provider="deepseek")
+        if res_ds.budget_stop:
+            stats["budget_stop"] = True
+            return recovered
+        stats["llm_calls"] += 1
+        if not res_ds.err:
+            recovered = {r["id"]: r for r in parse_rows(res_ds.text)}
+    return recovered
+
+
 # ------------------------------------------------------------------ 处置
 def _notify_l3(entry, reason: str) -> int:
     """L3 点名的系统通知（1 = 已提交，0 = 没发）。
@@ -448,14 +513,17 @@ def _log_run(stats):
     f = fields(src="triage", pending=stats.get("pending"), rated=stats.get("rated"),
                llm=stats.get("llm_calls"), l0=stats.get("l0_marked"),
                l3n=stats.get("l3_notified"),
-               fail=stats.get("fail_open"), ms=stats.get("ms"))
+               fail=stats.get("fail_open"), pe=stats.get("parse_empty"),
+               prec=stats.get("parse_recovered"), ms=stats.get("ms"))
     if not stats.get("pending"):
         log.debug("分级一轮：无待判条目（耗时 %sms）", stats.get("ms"), extra=f)
         return
-    log.info("分级一轮：%s 个源 / 待判 %s 条 → 判定 %s（零成本默认 %s · 失败兜底 %s）"
+    log.info("分级一轮：%s 个源 / 待判 %s 条 → 判定 %s（零成本默认 %s · 失败兜底 %s"
+             "· 其中解析空票 %s 批 / 救回 %s 批）"
              "｜LLM %s 次｜标已读 %s · L3 通知 %s｜%sms",
              stats.get("scanned_feeds"), stats.get("pending"), stats.get("rated"),
-             stats.get("defaulted"), stats.get("fail_open"), stats.get("llm_calls"),
+             stats.get("defaulted"), stats.get("fail_open"), stats.get("parse_empty"),
+             stats.get("parse_recovered"), stats.get("llm_calls"),
              stats.get("l0_marked"), stats.get("l3_notified"), stats.get("ms"), extra=f)
     for err in stats.get("errors") or []:
         log.warning("分级一轮遗留：%s", err, extra=fields(src="triage"))
@@ -470,6 +538,12 @@ def _run_once(feed_ids=None, dry_run=False, max_calls=None):
     stats = {"scanned_feeds": len(pending), "pending": sum(len(v) for v in pending.values()),
              "rated": 0, "defaulted": 0, "fail_open": 0, "llm_calls": 0,
              "l0_marked": 0, "l3_notified": 0,
+             # ★ 解析空票批次数（2026-11-26）：调用 HTTP 200 / ok=1 / err 空，
+             #   却一张票都解析不出来。旧实现只累加 fail_open，日志和健康页都看不出
+             #   「调用成功但解析失败」和「真调用失败」的区别 —— 必须单独计数 + 打 warning。
+             "parse_empty": 0,
+             # 救回统计：parse_recovered=救回成功的批次数，rows=找回的票数
+             "parse_recovered": 0, "parse_recovered_rows": 0,
              "budget_stop": False, "errors": []}
     if not pending:
         return stats
@@ -538,6 +612,37 @@ def _run_once(feed_ids=None, dry_run=False, max_calls=None):
 
             rows = parse_rows(text) if not err else []
             got = {r["id"]: r for r in rows}
+            # ★ 静默失败显形（2026-11-26）：ok=1 / err 空 / finish=stop，却解析不出一张票。
+            #   旧实现直接整批 fail_open，LlmUsage 记 ok=1、error.log 一字没有——
+            #   但斌 feed 两次整批 10 条就这样无声掉了。这里至少在日志和 stats 留下痕迹。
+            silent_empty = bool(text and not err and not rows)
+            if silent_empty:
+                stats["parse_empty"] += 1
+                log.warning(
+                    "分级解析空票：feed=%s batch=%d 条 / 输出 %s 字符，HTTP 成功却零有效票，尝试救回",
+                    feed_id, len(batch), len(text),
+                    extra=fields(src="triage", stage="parse_empty", feed=feed_id,
+                                 batch=len(batch), out_chars=len(text),
+                                 model=cfg.get("model")))
+                # ★ 方案1 救回（2026-11-26）：带反馈重试 1 次 → 仍空显式 ds 1 次。
+                #   救回的票按 id 替换 got（不是追加，票数恒定）；都失败才让下面
+                #   的 `if not votes` 落 fail_open。救回成功要消掉 silent_empty，
+                #   why 才不会误标成「解析空票」。dry_run 也走同一条救回链（调用
+                #   照样记账，只是不写 EntryRating），验证的是同一条判定路径。
+                rescued = rescue_empty_parse(
+                    messages, feed_id=feed_id, category_id=category_id,
+                    temperature=0.1, timeout=90,
+                    stats=stats, max_calls=max_calls)
+                if rescued:
+                    got.update(rescued)      # 替换同名票，不追加
+                    stats["parse_recovered"] += 1
+                    stats["parse_recovered_rows"] += len(rescued)
+                    log.warning(
+                        "分级解析空票救回：feed=%s 找回 %d 张票（反馈重试 / ds）",
+                        feed_id, len(rescued),
+                        extra=fields(src="triage", stage="parse_recovered",
+                                     feed=feed_id, rows=len(rescued)))
+                    silent_empty = False
 
             for e in batch:
                 if stats["budget_stop"]:
@@ -573,10 +678,16 @@ def _run_once(feed_ids=None, dry_run=False, max_calls=None):
                             failed = True
 
                 if not votes:
-                    level, reason, info = default_level, "fail_open", {"reason": err or "无有效票"}
+                    # ★ why 区分来源（2026-11-26）：调用失败 vs 调用成功却解析零票。
+                    #   两者都落 fail_open，但根因不同——健康页 fail_rows 直接显示 why，
+                    #   混成「无有效票」会让解析失败继续隐身。
+                    why = ("解析空票（HTTP 成功但输出无有效票）" if silent_empty
+                           else (err or "无有效票"))
+                    level, reason, info = default_level, "fail_open", {"reason": why}
                     stats["fail_open"] += 1
-                    votes = [{"level": default_level, "why": f"fail-open（{err or '无有效票'}）",
-                              "_fail_open": True}]
+                    votes = [{"level": default_level, "why": f"fail-open（{why}）",
+                              "_fail_open": True,
+                              "fail_kind": "parse_empty" if silent_empty else "call_error"}]
                 else:
                     level, info = aggregate_level(votes, default_level)
                     reason = "llm"
@@ -775,6 +886,12 @@ def overview(calls: int = 20, fails: int = 60) -> dict:
 
     fail_qs = EntryRating.objects.filter(reason="fail_open").order_by("-rated_at")
     fail_total = fail_qs.count()
+    # ★ 解析空票 vs 真调用失败分开计数（2026-11-26）：健康页一眼看出「ok=1 却零票」
+    #   的静默失败占比，而不是把所有 fail_open 都当网络故障。
+    fail_parse_empty = sum(
+        1 for v in fail_qs.values_list("votes", flat=True)
+        if isinstance(v, list) and v and isinstance(v[0], dict)
+        and v[0].get("fail_kind") == "parse_empty")
     fail_rows = [{
         "entry_id": r.entry_id, "feed_id": r.feed_id,
         "title": (nodes[r.feed_id].title if r.feed_id in nodes else f"#{r.feed_id}"),
@@ -822,6 +939,7 @@ def overview(calls: int = 20, fails: int = 60) -> dict:
         "pending_total": pend_total,
         "pending_rows": pending_rows,
         "fail_total": fail_total,
+        "fail_parse_empty": fail_parse_empty,
         "fail_rows": fail_rows,
         "by_reason": by_reason,
         "by_level": by_level,

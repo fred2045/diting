@@ -289,6 +289,11 @@ check("triage：run_once 收尾走 _log_run，INFO 说清判了多少、DEBUG �
       and "无待判条目" in TRIAGE)
 check("triage：无待判走 DEBUG（每 5 分钟一轮，INFO 会变成 288 行/天噪音）",
       'log.debug("分级一轮：无待判条目' in TRIAGE and 'log.info("分级一轮：' in TRIAGE)
+check("triage：调用成功却零票必须 WARNING + 计数（2026-11-26 静默事故防复发）",
+      'log.warning(\n                    "分级解析空票' in TRIAGE
+      and 'stage="parse_empty"' in TRIAGE
+      and 'stats["parse_empty"] += 1' in TRIAGE
+      and 'stage="parse_recovered"' in TRIAGE)
 check("llm.chat：成功 DEBUG / 认证失败 ERROR / 最终失败 WARNING 三级齐全",
       'log.debug("llm ok' in LLM and "log.error(\"llm 认证失败" in LLM
       and 'log.warning("llm 调用失败' in LLM)
