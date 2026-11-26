@@ -94,8 +94,13 @@ def profile_text() -> str:
     p = settings.PROJECT_ROOT / "Meta" / "interest-profile.md"
     try:
         return p.read_text(encoding="utf-8").strip()
-    except OSError:
-        log.warning("兴趣画像缺失：%s", p)
+    except FileNotFoundError:
+        # 真缺文件：这是要人处理的事，报 ERROR 而非 WARNING，避免淹没在噪音里。
+        log.error("兴趣画像文件不存在：%s", p)
+        return ""
+    except OSError as exc:
+        # 文件在、但读失败（并发瞬时 IO 失败等）：只 WARNING，且别谎称「缺失」。
+        log.warning("兴趣画像读取失败（%s）：%s", exc, p)
         return ""
 
 

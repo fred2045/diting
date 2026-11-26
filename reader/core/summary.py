@@ -305,7 +305,7 @@ S0_USER = """基于下面的素材生成一份 Markdown 日报。
     按分类各写 2–4 条最值得看的，写不完就先写重要的，**绝不为了凑数拉长**。
 
 【窗口】{window}
-【条目统计】窗口内 {n} 条来自 {p} 个源（其中 {unrated} 条尚未分级，按该源默认级别处理）
+【条目统计】窗口内 {n} 条来自 {p} 个源（其中 {unrated} 条配了判据但尚未判定完，暂按该源默认级别处理）
 ★ 上面这一行是**系统元信息**，只供你判断素材规模；正文任何位置都不要复述它。
 
 【读者画像】（判断"对我重不重要 / 值不值得读"的主要依据；**不是分级判据**；分级是读者先验）
@@ -564,7 +564,7 @@ def _s0_pass(items, s1, by_cat, stats, run_id, anomalies, window_label,
                           f"{_level_brief(cat['items'])}）\n"
                           + "\n\n".join(_render_item(it) for it in cat["items"]))
             covered.extend(cat["items"])
-    unrated = sum(1 for it in items if not it["rated"])
+    unrated = sum(1 for it in items if it.get("unrated_reason") == "pending")
     material = "\n\n".join(blocks)
     # ★ 画像从「分级专属」共用过来：札记的「对我重不重要 / 值不值得读」全靠它。
     #   ★ 不再把数量统计喂给 S0 —— 喂了它就会去解读（每期都写"TOP3 源占比过大"），
@@ -613,6 +613,12 @@ def _stats_data(items, by_cat, nodes=None) -> dict:
                  "pct": (v[0] / total * 100 if total else 0)} for fid, v in top],
         "concentration": (sum(v[0] for _, v in top[:3]) / total * 100 if total else 0),
         "zero_cats": sum(1 for c in cats if not c["items"]),
+        # ★ 「未分级」拆两种，别混着报（2026-11-26 排查：53 条全是 no_criteria，
+        #   被误当成「分级没跑完」，实为「该源没配判据、本就走默认」）。
+        "unrated_pending": sum(1 for it in items
+                               if it.get("unrated_reason") == "pending"),
+        "unrated_default": sum(1 for it in items
+                               if it.get("unrated_reason") == "no_criteria"),
         "unrated": sum(1 for it in items if not it["rated"]),
         "kinds": kinds,
     }
@@ -635,11 +641,17 @@ def _stats_section(items, by_cat, nodes=None) -> str:
     dist = " · ".join(f"{KIND_LABEL.get(k, k)} {v}"
                       for k, v in sorted(d["kinds"].items(),
                                          key=lambda kv: -kv[1]))
+    # ★ 未分级拆两种：pending=配了判据但没跑完（真滞后）；default=没配判据走默认
+    unrated_parts = []
+    if d.get("unrated_pending"):
+        unrated_parts.append(f"未判定 {d['unrated_pending']} 条")
+    if d.get("unrated_default"):
+        unrated_parts.append(f"默认级别（未配判据）{d['unrated_default']} 条")
+    unrated_line = ("；" + "、".join(unrated_parts)) if unrated_parts else ""
     L = ["## 一、数量统计", "",
          f"- 总条目 **{d['total']}**；{src_line}；"
          f"分类 {len(d['cats'])} 个（0 产出 {d['zero_cats']}）",
-         f"- 集中度（TOP3 源）**{d['concentration']:.0f}%**；"
-         f"未分级 {d['unrated']} 条",
+         f"- 集中度（TOP3 源）**{d['concentration']:.0f}%**{unrated_line}",
          f"- 规则层分布：{dist or '—'}", ""]
 
     L += ["", "**按分类**", "", "| 分类 | 条数 | 占比 |", "| --- | --- | --- |"]
@@ -1083,10 +1095,14 @@ def render_rule_report(day, start, end, row, items, by_cat, anomalies, stats,
 
 # ==================================================================== 主流程
 def _meta_index():
-    """{feed_id: {title, category_id, category_title, default_level}} + 侧栏用树。
+    """{feed_id: {title, category_id, category_title, default_level, has_criteria}} + 侧栏用树。
 
     ★ 未评级条目的级别按该 feed 的 default_level 算（缺省全局 L2）——
       不再在 build_items 里写死 L2，否则「默认 L1 的低价值源」会被误抬成关注。
+    ★ `has_criteria`：该 feed（或其分类）是否配了分级判据 —— 与
+      `promptspec.criteria_index()` 同一口径（L0–L3 任一段非空才真）。
+      未评级条目据此区分「本就走默认（没配判据）」vs「配了判据但还没判定完」，
+      日报统计才能把这两种「未分级」说准确。
     """
     meta, tree = {}, []
     try:
@@ -1096,12 +1112,15 @@ def _meta_index():
     defaults = {r.feed_id: r.default_level
                 for r in FeedTriageConfig.objects.all()
                 if r.default_level is not None}
+    criteria_cats, criteria_feeds = promptspec.criteria_index()
     for cat in tree:
         for f in cat.feeds:
             meta[f.id] = {"title": f.title, "category_id": cat.id,
                           "category_title": cat.title, "node": f,
                           "default_level": defaults.get(f.id,
-                                                        settings.UNRATED_LEVEL)}
+                                                        settings.UNRATED_LEVEL),
+                          "has_criteria": (f.id in criteria_feeds
+                                           or cat.id in criteria_cats)}
     return meta, tree
 
 

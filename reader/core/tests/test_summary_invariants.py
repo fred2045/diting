@@ -279,6 +279,25 @@ class BuildItemsLevelTest(SimpleTestCase):
         self.assertTrue(items[0]["rated"])
         self.assertEqual(summary.level_label(items[0]), "L3")
 
+    def test_unrated_reason_distinguishes_pending_vs_default(self):
+        # ★ 未评级拆两类（2026-11-26）：配了判据但没跑完 = pending；
+        #   没配判据（走默认）= no_criteria。别混成一句「未分级」误导排查。
+        # 未配判据 → no_criteria
+        meta_plain = {7: {"title": "源", "category_id": 1, "category_title": "杂项",
+                          "default_level": 1, "has_criteria": False}}
+        items = summary.build_items([self._entry()], {}, meta_plain)
+        self.assertEqual(items[0]["unrated_reason"], "no_criteria")
+        # 配了判据但还没判定 → pending
+        meta_crit = {7: {"title": "源", "category_id": 1, "category_title": "杂项",
+                         "default_level": 1, "has_criteria": True}}
+        items = summary.build_items([self._entry()], {}, meta_crit)
+        self.assertEqual(items[0]["unrated_reason"], "pending")
+        # 已评级 → None
+        from core.models import EntryRating
+        rating = EntryRating(entry_id=1, feed_id=7, level=2, reason="llm")
+        items = summary.build_items([self._entry()], {1: rating}, meta_crit)
+        self.assertIsNone(items[0]["unrated_reason"])
+
     def test_blockquote_keeps_boundary_but_not_quote_kind(self):
         # 长文里的一段引用不是"整条引用转发"：要留边界，但不能因此丢掉 S3 压缩
         meta = {7: {"title": "源", "category_id": 1, "category_title": "杂项",

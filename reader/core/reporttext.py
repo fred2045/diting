@@ -359,10 +359,16 @@ def build_items(entries, ratings: dict, meta: dict) -> list:
             "raw_len": len(raw),
             "truncated": truncated,
             "is_quote": is_quote,
-            # 未评级（triage 还没跑到）按该 feed 的 default_level 处理；
-            # rated=False 仍保留，供素材标「未定级」并单独计数。
+            # 未评级按该 feed 的 default_level 处理；rated=False 仍保留，供素材
+            # 标「未定级」并单独计数。
+            # ★ unrated_reason 区分两类「未评级」，让日报统计说准确：
+            #   "no_criteria" = 该源（含分类）没配判据，本就该走默认级别（非缺陷）；
+            #   "pending"     = 配了判据但 triage 还没判定完（这才是真「未分级」）。
             "level": (r.level if r is not None else feed_default),
             "rated": r is not None,
+            "unrated_reason": (None if r is not None
+                               else ("pending" if m.get("has_criteria")
+                                     else "no_criteria")),
             "kind": classify_kind(e.title, text, is_quote=is_quote),
             "summary": "",       # S3 产出（超长单篇）
         })
