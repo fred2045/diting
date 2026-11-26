@@ -144,6 +144,13 @@ class ParseRowsTest(SimpleTestCase):
         self.assertEqual(triage.parse_rows("not json at all"), [])
         self.assertEqual(triage.parse_rows(""), [])
 
+    def test_multiple_json_blocks_with_prose_not_lost(self):
+        """★ 整段 3123 token 输出被贪婪正则吞掉的形态：逐段救回后仍有票。"""
+        text = ('说明：\n[{"id": 21, "level": "L0", "why": "x"}]\n'
+                '补充：\n[{"id": 22, "level": "L2", "why": "y"}]\n以上。')
+        rows = triage.parse_rows(text)
+        self.assertEqual([r["id"] for r in rows], [21, 22])
+
 
 class RateStateTest(SimpleTestCase):
     """状态判据是 reason 而不是 level：光看级别分不出判的/默认的/兜底的。"""

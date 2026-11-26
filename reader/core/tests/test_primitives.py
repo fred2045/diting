@@ -51,6 +51,23 @@ class IterJsonTest(SimpleTestCase):
     def test_garbage_yields_nothing(self):
         self.assertEqual(list(jsontool.iter_json("not json")), [])
 
+    def test_multi_arrays_with_prose_are_all_yielded(self):
+        """★ 2026-11-26 但斌 feed 事故的形态：多段 JSON 夹说明，贪婪整段吞掉必失败。"""
+        text = '好的：\n[{"id": 1}]\n另外：\n[{"id": 2}]\n以上。'
+        got = list(jsontool.iter_json(text))
+        self.assertEqual(got[:2], [[{"id": 1}], [{"id": 2}]])
+
+    def test_nested_array_not_sliced_by_non_greedy_regex(self):
+        """★ 逐段扫描必须用 JSON 解码器读完整值，不能靠非贪婪正则（会在内层 ] 截断）。"""
+        text = '结果：[{"a": [3, 4]}] 补充：[{"b": 5}]'
+        got = list(jsontool.iter_json(text))
+        self.assertEqual(got[0], [{"a": [3, 4]}])
+        self.assertEqual(got[1], [{"b": 5}])
+
+    def test_multi_dicts_with_prose_are_all_yielded(self):
+        got = list(jsontool.iter_json('前 {"id": 7} 中 {"id": 8} 后'))
+        self.assertEqual(got[:2], [{"id": 7}, {"id": 8}])
+
 
 class MdLinesTest(SimpleTestCase):
     def test_cells(self):

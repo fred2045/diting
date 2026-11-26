@@ -331,8 +331,14 @@ def _render_items(entries):
 
 
 def parse_rows(text):
-    """从模型输出里捞出 [{id, level, one_line, why}]（JSON 提取见 core.jsontool）。"""
+    """从模型输出里捞出 [{id, level, one_line, why}]（JSON 提取见 core.jsontool）。
+
+    ★ 收集**所有**有效候选，不再「第一个有票就 return」（2026-11-26 逐段解析后暴露）：
+      `iter_json` 逐段救回多段 JSON 时，提前 return 会把后续段的票全丢掉 —— 等于
+      逐段解析白做。按 id 去重、保留先出现的票，避免同一条被多段重复计票。
+    """
     rows = []
+    seen = set()
     for data in jsontool.iter_json(text):
         if isinstance(data, dict):
             data = [data]
@@ -341,14 +347,16 @@ def parse_rows(text):
             if lv is None or row.get("id") is None:
                 continue
             try:
-                rows.append({"id": int(row["id"]), "level": lv,
-                             "one_line": str(row.get("one_line", ""))[:80],
-                             "why": str(row.get("why", ""))[:80]})
+                rid = int(row["id"])
             except (TypeError, ValueError):
                 continue
-        if rows:
-            return rows
-    return []
+            if rid in seen:
+                continue
+            seen.add(rid)
+            rows.append({"id": rid, "level": lv,
+                         "one_line": str(row.get("one_line", ""))[:80],
+                         "why": str(row.get("why", ""))[:80]})
+    return rows
 
 
 # ------------------------------------------------------------------ 处置
