@@ -591,7 +591,54 @@ KIND_LABEL = {"normal": "正常", "title_only": "标题流", "quote": "引用转
               "reply": "互动回复", "repost": "转贴"}
 
 
-def _stats_data(items, by_cat, nodes=None) -> dict:
+def _level_distribution(entries, ratings, meta, dropped_l1) -> dict:
+    """窗口内**全部**条目的分级去向（含被 L0 过滤、被 L1 截断丢掉的）。
+
+    ★ 2026-11-27 补：日报「数量统计」之前只报「未分级的残缺口径」，读者看不到
+      分级这一刀到底把内容切成了什么。这里摊出完整分布，让每条都有去处：
+        · l0        判 L0（不进日报，fail-open/未评级默认 L0 也算）
+        · l1 / l2 / l3  判 L1/L2/L3（真判过，reason=llm/manual 的 level）
+        · l1_dropped 判 L1 但被单源上限 cap_feed_l1 丢掉（dropped_l1）
+        · default    未配判据走默认级别（reason=default 或库里无记录且源无判据）
+        · fail       判定失败兜底（reason=fail_open）
+        · pending    配了判据但还没判定完（库里无记录且源有判据）
+
+    ★ L0 必须在这里算：`build_items` 里 L0 是 `continue` 掉的，`items` 里看不到，
+      只从 `items` 反推会漏掉这一整档。
+    """
+    dist = {"l0": 0, "l1": 0, "l2": 0, "l3": 0, "default": 0,
+            "fail": 0, "pending": 0, "l1_dropped": int(dropped_l1 or 0)}
+    for e in entries:
+        r = ratings.get(e.id)
+        if r is not None:
+            reason = getattr(r, "reason", "") or ""
+            if reason == "fail_open":
+                dist["fail"] += 1
+                continue
+            if reason == "default":
+                dist["default"] += 1
+                continue
+            if reason in ("llm", "manual"):
+                lv = getattr(r, "level", None)
+                key = f"l{lv}" if lv in (0, 1, 2, 3) else None
+                if key:
+                    dist[key] += 1
+                continue
+            # 其它 reason 兜底按级别算（理论上到不了这里）
+            lv = getattr(r, "level", None)
+            if lv in (0, 1, 2, 3):
+                dist[f"l{lv}"] += 1
+            continue
+        # 库里无记录：按该 feed 是否配判据分 pending / default
+        m = meta.get(e.feed_id) or {}
+        if m.get("has_criteria"):
+            dist["pending"] += 1
+        else:
+            dist["default"] += 1
+    return dist
+
+
+def _stats_data(items, by_cat, nodes=None, level_dist=None) -> dict:
     """算一份真值。**统计不让模型算** —— 它只会照着素材里的数字编。"""
     by_feed = {}
     for it in items:
@@ -613,18 +660,22 @@ def _stats_data(items, by_cat, nodes=None) -> dict:
                  "pct": (v[0] / total * 100 if total else 0)} for fid, v in top],
         "concentration": (sum(v[0] for _, v in top[:3]) / total * 100 if total else 0),
         "zero_cats": sum(1 for c in cats if not c["items"]),
-        # ★ 「未分级」拆两种，别混着报（2026-11-26 排查：53 条全是 no_criteria，
-        #   被误当成「分级没跑完」，实为「该源没配判据、本就走默认」）。
+        # ★ 「未分级」拆三种，别混着报（2026-11-26 排查：53 条全是 no_criteria，
+        #   被误当成「分级没跑完」，实为「该源没配判据、本就走默认」；2026-11-27
+        #   再补 fail_open：配了判据但判定失败、级别不可信，是另一回事）。
         "unrated_pending": sum(1 for it in items
                                if it.get("unrated_reason") == "pending"),
         "unrated_default": sum(1 for it in items
                                if it.get("unrated_reason") == "no_criteria"),
+        "unrated_fail": sum(1 for it in items
+                            if it.get("unrated_reason") == "fail_open"),
         "unrated": sum(1 for it in items if not it["rated"]),
         "kinds": kinds,
+        "level_dist": level_dist or {},
     }
 
 
-def _stats_section(items, by_cat, nodes=None) -> str:
+def _stats_section(items, by_cat, nodes=None, level_dist=None) -> str:
     """「一、数量统计」：**系统生成** —— 总览用文字行，明细留两张表。
 
     ★ 为什么系统生成：原来是让 S0 用散文复述我们给它的数字。
@@ -635,24 +686,25 @@ def _stats_section(items, by_cat, nodes=None) -> str:
       竖表反而把读者视线打断；「按分类」「按源」是多行明细，表格才扫得快 ——
       所以只保留这两张表。
     """
-    d = _stats_data(items, by_cat, nodes)
+    d = _stats_data(items, by_cat, nodes, level_dist=level_dist)
     src_line = (f"有产出源 / 全部源 {d['feeds_with']} / {d['feeds_all']}"
                 if d["feeds_all"] is not None else f"有产出源 {d['feeds_with']}")
     dist = " · ".join(f"{KIND_LABEL.get(k, k)} {v}"
                       for k, v in sorted(d["kinds"].items(),
                                          key=lambda kv: -kv[1]))
-    # ★ 未分级拆两种：pending=配了判据但没跑完（真滞后）；default=没配判据走默认
-    unrated_parts = []
-    if d.get("unrated_pending"):
-        unrated_parts.append(f"未判定 {d['unrated_pending']} 条")
-    if d.get("unrated_default"):
-        unrated_parts.append(f"默认级别（未配判据）{d['unrated_default']} 条")
-    unrated_line = ("；" + "、".join(unrated_parts)) if unrated_parts else ""
+    # ★ 分级去向（窗口内全部条目的完整分布，含被过滤/被丢的）。未配判据/判定失败/
+    #   未判定这三档也一并收进这里 —— 它们是分级的去向之一，不该拆出去在「集中度」
+    #   行里单报一遍（2026-11-27 改：旧版只在集中度行报「未分级」残缺口径，既漏 L0
+    #   被过滤、L1 被丢，又把 default/fail 当「未分级」混着说，数字还是错的）。
+    level_line = _level_line(level_dist)
     L = ["## 一、数量统计", "",
          f"- 总条目 **{d['total']}**；{src_line}；"
          f"分类 {len(d['cats'])} 个（0 产出 {d['zero_cats']}）",
-         f"- 集中度（TOP3 源）**{d['concentration']:.0f}%**{unrated_line}",
-         f"- 规则层分布：{dist or '—'}", ""]
+         f"- 集中度（TOP3 源）**{d['concentration']:.0f}%**",
+         f"- 规则层分布：{dist or '—'}"]
+    if level_line:
+        L.append(f"- 分级去向：{level_line}")
+    L.append("")
 
     L += ["", "**按分类**", "", "| 分类 | 条数 | 占比 |", "| --- | --- | --- |"]
     for c in d["cats"]:
@@ -667,6 +719,31 @@ def _stats_section(items, by_cat, nodes=None) -> str:
         L.append(f"| 其余 {d['feeds_with'] - len(d['top'])} 个源 | — | {rest} | "
                  f"{rest / d['total'] * 100:.0f}% |")
     return "\n".join(L)
+
+
+def _level_line(level_dist: dict) -> str:
+    """把分级去向 dict 拼成一行文字（仅列出非零项，按逻辑顺序）。"""
+    if not level_dist:
+        return ""
+    parts = []
+    # 顺序：L0（过滤）→ L1 → L2 → L3 → 未配判据 → 判定失败 → 未判定
+    if level_dist.get("l0"):
+        parts.append(f"L0（不进日报）{level_dist['l0']}")
+    if level_dist.get("l1"):
+        parts.append(f"L1 {level_dist['l1']}")
+    if level_dist.get("l1_dropped"):
+        parts.append(f"L1 因源上限丢弃 {level_dist['l1_dropped']}")
+    if level_dist.get("l2"):
+        parts.append(f"L2 {level_dist['l2']}")
+    if level_dist.get("l3"):
+        parts.append(f"L3 {level_dist['l3']}")
+    if level_dist.get("default"):
+        parts.append(f"未配判据（默认）{level_dist['default']}")
+    if level_dist.get("fail"):
+        parts.append(f"判定失败 {level_dist['fail']}")
+    if level_dist.get("pending"):
+        parts.append(f"未判定 {level_dist['pending']}")
+    return " · ".join(parts)
 
 
 def _stats_block(items, by_cat, nodes=None) -> str:
@@ -1080,7 +1157,8 @@ def render_rule_report(day, start, end, row, items, by_cat, anomalies, stats,
     **统计与异常一定在**，内容部分退化为按分类的条目清单。
     """
     L = _header(day, start, end, row, stats)
-    L += [_stats_section(items, by_cat, nodes), ""]
+    L += [_stats_section(items, by_cat, nodes,
+                         level_dist=stats.get("level_dist")), ""]
     L += ["## 二、异常告警", "", *(anomalies or ["- （无异常）"]), ""]
     L += ["## 三、内容（规则版 · 未调用模型）", ""]
     for cat in sorted(by_cat.values(), key=lambda c: -len(c["items"])):
@@ -1407,6 +1485,10 @@ def run(day: _date = None, *, catch_up: bool = False, force: bool = False,
         items = build_items(entries, ratings, meta)
         items, stats["dropped_l1"] = cap_feed_l1(
             items, settings.SUMMARY_FEED_MAX_ITEMS, settings.SUMMARY_FEED_L1_KEEP)
+        # ★ 分级去向：窗口内**全部**条目的完整分布（含 L0 被过滤、L1 被丢）。
+        #   在 build_items 之后算 —— L0 已被 continue 掉，只能从原始 entries 反推。
+        stats["level_dist"] = _level_distribution(
+            entries, ratings, meta, stats["dropped_l1"])
         if stats["dropped_l1"]:
             log.info("单源 L1 过多：%s 条未纳入日报（L2/L3 全部保留）",
                      stats["dropped_l1"],
@@ -1463,14 +1545,16 @@ def run(day: _date = None, *, catch_up: bool = False, force: bool = False,
             stats["num_unknown"] = number_audit(
                 body, "\n".join([window_label]
                                 + list(anomalies)
-                                + [_stats_section(items, by_cat, nodes)]
+                                + [_stats_section(items, by_cat, nodes,
+                                                  level_dist=stats.get("level_dist"))]
                                 + [f"{it['title']} {it['text']}" for it in items]))
             # ★ 外链 → 站内深链（点击定位到那条并展开，src=daily 供打开率统计）。
             #   必须在 number_audit / _cite_coverage 之后：它们按**素材外链**匹配，
             #   先改写会让覆盖统计清零（internalize_cites 的时序契约）。
             body = internalize_cites(body, url_map, "daily")
             md_lines = _header(day, start, end, row, stats)
-            md_lines += [_stats_section(items, by_cat, nodes), "", body, ""]
+            md_lines += [_stats_section(items, by_cat, nodes,
+                                        level_dist=stats.get("level_dist")), "", body, ""]
             md = "\n".join(md_lines)
         else:
             # 规则版逐条都渲染了引用行 → 两个口径天然 100%，但头部也要如实写出来，

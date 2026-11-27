@@ -298,6 +298,31 @@ class BuildItemsLevelTest(SimpleTestCase):
         items = summary.build_items([self._entry()], {1: rating}, meta_crit)
         self.assertIsNone(items[0]["unrated_reason"])
 
+    def test_reason_default_and_fail_open_not_treated_as_rated(self):
+        # ★ 2026-11-27：库里**有**评级记录 ≠ 已判定。reason=default（没配判据、
+        #   零成本落默认）与 reason=fail_open（判定失败兜底）都不算「判过」，
+        #   必须进「未分级」统计，而不是被 `r is not None` 误当已评级跳过。
+        from core.models import EntryRating
+        meta = {7: {"title": "源", "category_id": 1, "category_title": "杂项",
+                    "default_level": 2, "has_criteria": False}}
+        # reason=default → no_criteria，且 rated=False
+        r_default = EntryRating(entry_id=1, feed_id=7, level=2, reason="default")
+        items = summary.build_items([self._entry()], {1: r_default}, meta)
+        self.assertEqual(items[0]["unrated_reason"], "no_criteria")
+        self.assertFalse(items[0]["rated"])
+        self.assertEqual(summary.level_label(items[0]), "未定级·L2")
+        # reason=fail_open → fail_open，且 rated=False
+        r_fail = EntryRating(entry_id=1, feed_id=7, level=1, reason="fail_open")
+        items = summary.build_items([self._entry()], {1: r_fail}, meta)
+        self.assertEqual(items[0]["unrated_reason"], "fail_open")
+        self.assertFalse(items[0]["rated"])
+        self.assertEqual(summary.level_label(items[0]), "失败兜底·L1")
+        # reason=manual → 真判过（人工），rated=True
+        r_manual = EntryRating(entry_id=1, feed_id=7, level=3, reason="manual")
+        items = summary.build_items([self._entry()], {1: r_manual}, meta)
+        self.assertIsNone(items[0]["unrated_reason"])
+        self.assertTrue(items[0]["rated"])
+
     def test_blockquote_keeps_boundary_but_not_quote_kind(self):
         # 长文里的一段引用不是"整条引用转发"：要留边界，但不能因此丢掉 S3 压缩
         meta = {7: {"title": "源", "category_id": 1, "category_title": "杂项",
@@ -352,3 +377,76 @@ class CapFeedL1Test(SimpleTestCase):
         kept, dropped = summary.cap_feed_l1(items, max_items=40, keep_l1=20)
         self.assertEqual(dropped, 0)
         self.assertEqual(len([it for it in kept if it["level"] == 2]), 50)
+
+
+class LevelDistributionTest(SimpleTestCase):
+    """分级去向：窗口内全部条目的完整分布（含被过滤/被丢的），各去向之和 = 总条目。
+
+    ★ 2026-11-27 补：日报统计之前只报「未分级」残缺口径，L0 被过滤、L1 被丢、
+      reason=default/fail_open 全都被漏掉或误算。这里锁住完整口径，防再退化。
+    """
+
+    def _entry(self, eid):
+        from types import SimpleNamespace
+        return SimpleNamespace(id=eid, feed_id=7)
+
+    def _rating(self, eid, reason, level=2):
+        from core.models import EntryRating
+        return EntryRating(entry_id=eid, feed_id=7, reason=reason, level=level)
+
+    def test_full_distribution_sums_to_total(self):
+        from core.models import EntryRating
+        entries = [self._entry(i) for i in range(1, 8)]
+        # 1=L0, 2=L1, 3=L2, 4=L3, 5=default, 6=fail_open, 7=llm(L2)
+        ratings = {
+            1: EntryRating(entry_id=1, feed_id=7, reason="llm", level=0),
+            2: EntryRating(entry_id=2, feed_id=7, reason="llm", level=1),
+            3: EntryRating(entry_id=3, feed_id=7, reason="llm", level=2),
+            4: EntryRating(entry_id=4, feed_id=7, reason="llm", level=3),
+            5: EntryRating(entry_id=5, feed_id=7, reason="default", level=2),
+            6: EntryRating(entry_id=6, feed_id=7, reason="fail_open", level=1),
+            7: EntryRating(entry_id=7, feed_id=7, reason="manual", level=2),
+        }
+        meta = {7: {"default_level": 2, "has_criteria": True}}
+        dist = summary._level_distribution(entries, ratings, meta, dropped_l1=0)
+        self.assertEqual(dist["l0"], 1)
+        self.assertEqual(dist["l1"], 1)
+        self.assertEqual(dist["l2"], 2)   # entry 3(llm) + 7(manual)
+        self.assertEqual(dist["l3"], 1)
+        self.assertEqual(dist["default"], 1)
+        self.assertEqual(dist["fail"], 1)
+        self.assertEqual(dist["pending"], 0)
+        # 各去向之和 = 总条目（l1_dropped 是 l1 的子集，不重复计入）
+        total = sum(v for k, v in dist.items() if k != "l1_dropped")
+        self.assertEqual(total, len(entries))
+
+    def test_no_record_and_no_criteria_counts_default(self):
+        # 库里无记录且源无判据 → default；无记录且有判据 → pending
+        entries = [self._entry(1), self._entry(2)]
+        meta_nocrit = {7: {"default_level": 2, "has_criteria": False}}
+        dist = summary._level_distribution(entries, {}, meta_nocrit, 0)
+        self.assertEqual(dist["default"], 2)
+        self.assertEqual(dist["pending"], 0)
+        meta_crit = {7: {"default_level": 2, "has_criteria": True}}
+        dist = summary._level_distribution(entries, {}, meta_crit, 0)
+        self.assertEqual(dist["pending"], 2)
+        self.assertEqual(dist["default"], 0)
+
+    def test_level_line_only_nonzero_and_ordered(self):
+        dist = {"l0": 74, "l1": 65, "l1_dropped": 8, "l2": 42, "l3": 4,
+                "default": 99, "fail": 6, "pending": 0}
+        line = summary._level_line(dist)
+        # pending=0 不出现；L0 在前、判定失败在后（逻辑顺序）
+        self.assertIn("L0（不进日报）74", line)
+        self.assertIn("L1 65", line)
+        self.assertIn("L1 因源上限丢弃 8", line)
+        self.assertIn("L2 42", line)
+        self.assertIn("L3 4", line)
+        self.assertIn("未配判据（默认）99", line)
+        self.assertIn("判定失败 6", line)
+        self.assertNotIn("未判定", line)   # pending=0 不显示
+        self.assertLess(line.index("L0"), line.index("判定失败"))
+
+    def test_empty_dist_returns_empty_line(self):
+        self.assertEqual(summary._level_line({}), "")
+        self.assertEqual(summary._level_line(None), "")

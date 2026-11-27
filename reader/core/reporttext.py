@@ -306,6 +306,28 @@ def body_text(blk: dict) -> str:
 
 
 # ==================================================================== 待办装配
+def _unrated_reason(r, meta: dict):
+    """一条素材的「未评级」来源归类（供日报统计说准确）。
+
+    ★ 2026-11-27 修正：旧版用 `r is None` 一刀切 —— 库里**有**评级记录就把条目
+      当「已判定」跳过。但 EntryRating.reason 有四种，其中两种根本不是判定结果：
+        · default    未配判据，零成本落 default_level（没调模型）
+        · fail_open  调了模型但失败/无有效票，兜底落 default_level（级别不可信）
+      实测窗口 290 条里 default 99 条、fail_open 6 条，旧逻辑全算「已评级」，
+      日报于是只报「默认级别（未配判据）1 条」且对失败只字不提。
+
+    返回 None（真判过 llm/manual）或 "no_criteria" / "pending" / "fail_open"。
+    """
+    if r is not None:
+        reason = getattr(r, "reason", "") or ""
+        if reason == "fail_open":
+            return "fail_open"
+        if reason == "default":
+            return "no_criteria"
+        return None                      # llm / manual：真判过
+    return "pending" if meta.get("has_criteria") else "no_criteria"
+
+
 def build_items(entries, ratings: dict, meta: dict) -> list:
     """把 Entry → 素材 dict；跳过分级 L0（已读、fail-open、未评级且源默认 L0 都不进总结）。
 
@@ -361,14 +383,19 @@ def build_items(entries, ratings: dict, meta: dict) -> list:
             "is_quote": is_quote,
             # 未评级按该 feed 的 default_level 处理；rated=False 仍保留，供素材
             # 标「未定级」并单独计数。
-            # ★ unrated_reason 区分两类「未评级」，让日报统计说准确：
+            # ★ unrated_reason 区分「未评级」的三种来源，让日报统计说准确
+            #   （2026-11-27 修正：旧版只看 `r is None`，把 reason=default/fail_open
+            #   的条目误当「已判定」跳过 —— 实测窗口 290 条里 default 99 条、
+            #   fail_open 6 条，日报却只报「默认级别 1 条」且完全没提失败）：
             #   "no_criteria" = 该源（含分类）没配判据，本就该走默认级别（非缺陷）；
-            #   "pending"     = 配了判据但 triage 还没判定完（这才是真「未分级」）。
+            #                   含 reason=default（零成本落默认）与库里无记录的未配判据源。
+            #   "pending"     = 配了判据但 triage 还没判定完（这才是真「未分级」）；
+            #   "fail_open"   = 配了判据、调了模型，但调用/解析失败，兜底落到 default
+            #                   （reason=fail_open，级别不可信，需单独报出来）。
+            #   None          = 真判过（reason=llm / manual）。
             "level": (r.level if r is not None else feed_default),
-            "rated": r is not None,
-            "unrated_reason": (None if r is not None
-                               else ("pending" if m.get("has_criteria")
-                                     else "no_criteria")),
+            "rated": (r is not None and getattr(r, "reason", "") in ("llm", "manual")),
+            "unrated_reason": _unrated_reason(r, m),
             "kind": classify_kind(e.title, text, is_quote=is_quote),
             "summary": "",       # S3 产出（超长单篇）
         })
@@ -378,11 +405,17 @@ def build_items(entries, ratings: dict, meta: dict) -> list:
 
 
 def level_label(item) -> str:
-    """素材里的级别角标：L0–L3；未评级写「未定级·Lx」（x=feed 默认级别）。"""
-    if not item.get("rated", True):
-        lv = item.get("level")
-        return f"未定级·L{lv}" if lv is not None else "未定级"
+    """素材里的级别角标：L0–L3；未评级写「未定级·Lx」（x=feed 默认级别）。
+
+    ★ 2026-11-27 补：判定失败（reason=fail_open）单独标「失败兜底·Lx」——
+      它的级别不可信，和「未定级」（还没判）不是一回事，混写会让人把
+      失败兜底的值误当成分级结果。
+    """
     lv = item.get("level")
+    if item.get("unrated_reason") == "fail_open":
+        return f"失败兜底·L{lv}" if lv is not None else "失败兜底"
+    if not item.get("rated", True):
+        return f"未定级·L{lv}" if lv is not None else "未定级"
     return f"L{lv}" if lv is not None else "未定级"
 
 
